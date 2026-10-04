@@ -1,5 +1,12 @@
 #!/usr/bin/env bash
-# OUR method and its ablations, x 5 permutations, on this host.
+# On this host (run_full.sh): the FewRel baselines, 7 distillation + 8 CL-LoRA methods x 5 perms.
+# Ours and its ablations run on the other host; the same matrix is kept below, reachable with
+# DS=ace (or DS=<ds> ONLY=g1).
+#
+#   bash project_commands.sh                            # FewRel baselines (what run_full.sh runs)
+#   DS=tacred bash project_commands.sh                  # the same baselines on TACRED
+#
+# OUR method and its ablations, x 5 permutations.
 # Round 3 (03/10) is what runs by default: on ACE the main-table run plus the ablations the
 # paper tables need; on any other dataset only the main-table run. Rounds 1 and 2 stay in
 # CONFIGS_ALL, commented out: uncomment a line and add its group to ONLY to re-run it.
@@ -10,7 +17,7 @@
 #   DRY=1 bash project_commands.sh                      # print the plan, train nothing
 #   ONLY="c" bash project_commands.sh                   # only some groups
 #
-# Defaults match this host: venv, GPUs 4-7, one run per GPU, effective batch 2x16 = 32.
+# Defaults: venv .venv, GPUs 4-7 (POOL_GPUS below), one job per GPU, effective batch 2x16 = 32.
 # Safe to re-run after a crash: a run with a .complete marker is skipped, and nothing is deleted.
 #
 # Effective batch stays 32 so every number is comparable with the f12_pl baseline. Per-device 32
@@ -21,11 +28,12 @@
 #   VENV          venv to activate (default: /mnt/local/uvenvs/opened when none is active)
 #   PY / ENV_BIN  interpreter and env bin/ for the runners (default: derived from `python`)
 #   SKIP_INSTALL  1 = never touch dependencies
-#   POOL_GPUS     one slot per GPU id (default "4 5 6 7")
+#   POOL_GPUS     set in the script: "4 5 6 7", one slot per GPU id
 #   PERMS         default "0 1 2 3 4"
-#   DS            dataset, default ace: ace maven rams geneva (CED), tacred fewrel (CRE)
+#   DS            dataset, default fewrel: ace maven rams geneva (CED), tacred fewrel (CRE)
 #   DATA_PREFIX   default <ds>_b10_perm (CED) or <ds>_perm (CRE), the names under data/
-#   ONLY          groups to run, default "g1 m a c d l" on ACE and "g1" elsewhere
+#   ONLY          groups to run, default "b" (baselines) on tacred/fewrel, "g1 m a c d l" on
+#                 ACE and "g1" on the other CED datasets
 #                 (bash owns $GROUPS, hence ONLY)
 set -euo pipefail
 cd "$(dirname "$0")"
@@ -75,8 +83,15 @@ if [ -f .env ] && [ -z "${HF_TOKEN:-}" ]; then
     echo "read HF_TOKEN from .env"
 fi
 if [ -f models/Qwen3-0.6B/config.json ]; then
+    # download.sh puts the model here, not in the HF cache, so offline loads need the path
+    export MODEL_PATH=${MODEL_PATH:-models/Qwen3-0.6B}
     export HF_HUB_OFFLINE=${HF_HUB_OFFLINE:-1} TRANSFORMERS_OFFLINE=${TRANSFORMERS_OFFLINE:-1}
 fi
+# The CRE runners default CUDA_HOME and the free-space guard to the A40 hosts' conda env and
+# /mnt; point them at this host instead.
+[ -z "${CUDA_HOME:-}" ] && [ -d /usr/local/cuda ] && export CUDA_HOME=/usr/local/cuda
+export CUDA_HOME=${CUDA_HOME:-$(dirname "${ENV_BIN}")}
+export DISK_PATH=${DISK_PATH:-.}
 
 # ---------------------------------------------------------------- 2. data
 step "2. data"
@@ -94,7 +109,7 @@ for tgz in *_all.tar.gz; do
     fi
 done
 PERMS=${PERMS:-"0 1 2 3 4"}
-DS=${DS:-ace}
+DS=${DS:-fewrel}
 case ${DS} in
     tacred|fewrel) DATA_PREFIX=${DATA_PREFIX:-${DS}_perm} ;;      # CRE splits ship in data/, built already
     *)             DATA_PREFIX=${DATA_PREFIX:-${DS}_b10_perm} ;;
@@ -124,6 +139,15 @@ CONFIGS_ALL=(
   "l_tree|cl|--data-prefix ${DS}_b0_perm|"
   "l_inclora|cl|--data-prefix ${DS}_b0_perm|"
   "l_olora|cl|--data-prefix ${DS}_b0_perm|"
+
+  # ---- baselines (04/10), CRE only (tacred, fewrel): one job = one perm of one family,
+  # each on one GPU. The runners skip every method that already finished.
+  #   b_dist    7 distillation methods (rkl csd sfkl fkl srkl amid distillm) on a shared task0,
+  #             scripts/qwen/cre/run_cre_dist.sh
+  #   b_cllora  8 CL-LoRA methods (tree inclora olora inflora epi migu gainlora_o gainlora_inf),
+  #             scripts/qwen/cre/run_cre_cllora.sh
+  "b_dist|credist||"
+  "b_cllora|crecl||"
 
   # ---- round 2 (01/10). Not used by any paper table any more; kept so it can be re-run.
   #   a_rand  KD/SD drawn at random per update (professor note 7b; --ced-sd-mix)
@@ -163,7 +187,11 @@ CONFIGS_ALL=(
   # "g5_warm|1||--sd-warmup 0.5"
   # "g5_rkl|1||--sd-div rkl"
 )
-if [ "${DS}" = "ace" ]; then ONLY=${ONLY:-"g1 m a c d l"}; else ONLY=${ONLY:-"g1"}; fi
+case ${DS} in
+    ace)           ONLY=${ONLY:-"g1 m a c d l"} ;;
+    tacred|fewrel) ONLY=${ONLY:-"b"} ;;
+    *)             ONLY=${ONLY:-"g1"} ;;
+esac
 
 CONFIGS=()
 for c in "${CONFIGS_ALL[@]}"; do
@@ -261,6 +289,7 @@ for p in ${PERMS}; do
     n_tasks=5  # TACRED / FewRel have 10; streams.json says how many
     have "data/${DATA_PREFIX}${p}/streams.json" && n_tasks=$("${PY}" -c \
         "import json,sys; print(len(json.load(open(sys.argv[1]))))" "data/${DATA_PREFIX}${p}/streams.json")
+    LAST_TASK=$((n_tasks - 1))
     for t in $(seq 0 $((n_tasks - 1))); do
         out="processed_data/${DATA_PREFIX}${p}/${t}"
         have "${out}/qwen/train_0.idx" && continue
@@ -286,17 +315,55 @@ run_dir () {  # $1=config name  $2=sd  $3=perm
     if [ "$1" = "task0" ]; then echo "${R}/dist_shared_task0_perm$3_${PROTOCOL}_s${SEED}"; return; fi
     # memory-0 CL-LoRA: its own protocol tag, so it never collides with the buffer-10 runs
     if [ "$2" = "cl" ]; then echo "${R}/cllora_${1#l_}_perm$3_${DS}_b0_v2_s${SEED}"; return; fi
+    # CRE baselines: one job covers several runs; this is only a label for the pool log
+    if [ "$2" = "credist" ] || [ "$2" = "crecl" ]; then echo "${R}/<$1 ${DS} perm$3>"; return; fi
     local tag=""; [ "$2" = "1" ] && tag="_sd"
     echo "${R}/ours_${VARIANT}${tag}_$1_perm$3_${PROTOCOL}_s${SEED}"
 }
 
+# Finished? One run dir with a .complete marker, except for the CRE baseline jobs, which are
+# done when every method's run is: the runners exit 0 even when a method failed.
+CRE_DIST_METHODS="rkl csd sfkl fkl srkl amid distillm"
+CRE_CLLORA_METHODS="tree inclora olora inflora epi migu gainlora_o gainlora_inf"
+job_done () {  # $1=config name  $2=sd  $3=perm
+    local m
+    case $2 in
+        credist)
+            for m in ${CRE_DIST_METHODS}; do
+                # either log layout counts (taskN/log.txt or taskN/<config>/log.txt), as in the
+                # runner; compgen, not ls | grep, which pipefail fails when one layout is absent
+                compgen -G "${R}/cre_${DS}_${m}_perm$3/task${LAST_TASK}/log.txt" > /dev/null \
+                    || compgen -G "${R}/cre_${DS}_${m}_perm$3/task${LAST_TASK}/*/log.txt" > /dev/null \
+                    || return 1
+            done ;;
+        crecl)
+            for m in ${CRE_CLLORA_METHODS}; do
+                [ -f "${R}/cllora_${m}_perm$3_${DS}_cre_s${SEED}/.complete" ] || return 1
+            done ;;
+        *) [ -f "$(run_dir "$1" "$2" "$3")/.complete" ] ;;
+    esac
+}
+
+# Ours' shared task0, only when a selected config trains on it (sd 0 or 1)
+NEED_T0=0
+for c in "${CONFIGS[@]}"; do
+    IFS='|' read -r _ sd _ _ <<< "${c}"
+    case ${sd} in 0|1) NEED_T0=1 ;; esac
+done
 JOBS=()
-for p in ${PERMS}; do JOBS+=("task0|0|||${p}"); done  # everything else waits on these; 5 fields like the rest
+if [ "${NEED_T0}" = "1" ]; then
+    for p in ${PERMS}; do JOBS+=("task0|0|||${p}"); done  # ours' jobs wait on these; 5 fields like the rest
+fi
 for c in "${CONFIGS[@]}"; do
     for p in ${PERMS}; do JOBS+=("${c}|${p}"); done
 done
 
-GPUS=(${POOL_GPUS:-4 5 6 7})
+POOL_GPUS="4 5 6 7"
+# The ids are nvidia-smi's (PCI order), and the runners both check memory with `nvidia-smi -i`
+# and train with CUDA_VISIBLE_DEVICES. CUDA's own default order is fastest-first, so make it
+# PCI order too, or on a mixed-GPU host the guard and the training would look at different cards.
+export CUDA_DEVICE_ORDER=PCI_BUS_ID
+GPUS=(${POOL_GPUS:-0})
 step "3. train ${#JOBS[@]} jobs on gpus ${GPUS[*]}"
 mkdir -p logs
 POOL_LOG=logs/${DS}_matrix_pool.log
@@ -317,6 +384,11 @@ launch () {  # $1=job $2=gpu -> starts it in the background
             --data-prefix "${DATA_PREFIX}" --perm "${perm}" \
             --rank 16 --alpha 64 --epochs 5 --lr 0.0002 --seed "${SEED}" \
             --bs 2 --acc 16 --greedy 1 --gpus "$2" --end-task 0
+    elif [ "${sd}" = "credist" ]; then
+        # its own torchrun port per GPU: several perms train side by side
+        MASTER_PORT=$((29500 + $2)) bash scripts/qwen/cre/run_cre_dist.sh "${DS}" "${perm}" "$2"
+    elif [ "${sd}" = "crecl" ]; then
+        bash scripts/qwen/cre/run_cre_cllora.sh "${DS}" "${perm}" "$2"
     elif [ "${sd}" = "cl" ]; then
         bash scripts/qwen/ced/run_cllora.sh --method "${name#l_}" --data-root "data/${DS}_b0_perm${perm}" \
             --protocol "${DS}_b0_v2" --seed "${SEED}" --gpu "$2" --py "${PY}"
@@ -339,17 +411,17 @@ pick () {  # sets JOB to the first startable job and drops it from PENDING; 1 if
     for i in "${!PENDING[@]}"; do
         job=${PENDING[i]}
         IFS='|' read -r name sd flags sd_args perm <<< "${job}"
-        if [ -f "$(run_dir "${name}" "${sd}" "${perm}")/.complete" ]; then
+        if job_done "${name}" "${sd}" "${perm}"; then
             log "skip   ${name}/perm${perm} (already complete)"
             unset 'PENDING[i]'; continue
         fi
-        if [ "${name}" != "task0" ] && [ "${sd}" != "cl" ]; then  # CL-LoRA trains its own task0
+        case ${sd} in cl|credist|crecl) ;; *) [ "${name}" = "task0" ] || {  # baselines train their own task0
             case ${T0[${perm}]} in
                 pending|running) continue ;;
                 failed) log "FAILED ${name}/perm${perm} (task0 of perm${perm} failed)"
                         n_fail=$((n_fail + 1)); unset 'PENDING[i]'; continue ;;
             esac
-        fi
+        } ;; esac
         JOB=${job}; unset 'PENDING[i]'
         [ "${name}" = "task0" ] && T0[${perm}]=running
         return 0
@@ -375,7 +447,7 @@ while :; do
             kill -0 "${pid}" 2>/dev/null && continue
             rc=0; wait "${pid}" || rc=$?
             job=${SLOT_JOB[i]}; IFS='|' read -r name sd flags sd_args perm <<< "${job}"
-            if [ "${rc}" -eq 0 ] && { [ "${DRY}" = "1" ] || [ -f "$(run_dir "${name}" "${sd}" "${perm}")/.complete" ]; }; then
+            if [ "${rc}" -eq 0 ] && { [ "${DRY}" = "1" ] || job_done "${name}" "${sd}" "${perm}"; }; then
                 log "done   ${name}/perm${perm} (gpu${GPUS[i]})"
                 [ "${name}" = "task0" ] && T0[${perm}]=done
             else
@@ -400,13 +472,23 @@ while :; do
     sleep 20
 done
 
-step "4. collect F1 files"
+step "4. collect logs and F1 files into logs/"
 # Before the failure exit below, so the runs that did finish are collected either way.
 # The label carries the dataset and time: gather_logs.sh refuses to reuse a folder.
+#   logs/results_<ds>_<time>/   eval F1 of every run: task*/**/log.txt, cl_results.json,
+#                               run_config.txt, run_manifest.json, .complete (results/ layout kept)
+#   logs/stdout/                each run's training stdout, which the runners write to
+#                               logs_<run>.log in the repo root (copied, the root files stay)
+COLLECT=results_${DS}_$(date +%Y%m%d_%H%M)
 if [ "${DRY}" = "1" ]; then
-    echo "DRY=1: would run gather_logs.sh ${DS}_$(date +%Y%m%d_%H%M)"
+    echo "DRY=1: would collect into logs/${COLLECT} and logs/stdout"
 else
-    bash gather_logs.sh "${DS}_$(date +%Y%m%d_%H%M)" || echo "gather_logs.sh failed, run it by hand"
+    OUT_ROOT=logs bash gather_logs.sh "${COLLECT}" || echo "gather_logs.sh failed, run it by hand"
+    mkdir -p logs/stdout
+    for f in logs_*.log; do
+        have "${f}" && cp -p "${f}" logs/stdout/
+    done
+    echo "training stdout: logs/stdout/ ($(ls logs/stdout | wc -l) files)"
 fi
 
 step "5. done"
@@ -414,4 +496,4 @@ if [ "${n_fail}" -gt 0 ]; then
     echo "${n_fail} jobs failed: grep FAILED ${POOL_LOG}"
     exit 1
 fi
-echo "all jobs finished, F1 files are under collected_logs/"
+echo "all jobs finished, logs and F1 files are under logs/"

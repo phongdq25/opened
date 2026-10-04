@@ -13,7 +13,7 @@ set -euo pipefail
 cd "$(dirname "$0")"
 
 LABEL=${1:-$(hostname -s)_$(date +%Y%m%d_%H%M)}
-OUT=collected_logs/${LABEL}
+OUT=${OUT_ROOT:-collected_logs}/${LABEL}   # OUT_ROOT=logs: project_commands.sh keeps everything in logs/
 [ -d results ] || { echo "no results/ here"; exit 1; }
 [ ! -e "${OUT}" ] || { echo "${OUT} already exists, pick another label"; exit 1; }
 mkdir -p "${OUT}"
