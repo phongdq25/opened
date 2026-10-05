@@ -75,28 +75,30 @@ def fake_smi(mib):
 
 
 @pytest.mark.parametrize("mib,expected", [
-    ("143771", "3 8 1 39833 18432 hf"),    # H200 NVL: the values tools/bench_gpu.sh measured
-    ("46068", "1 - 0 - - hf"),             # 46 GB cards: one run per GPU, the runners' own settings
-    ("0", "1 - 0 - - hf"),                 # no nvidia-smi
+    ("143771", "3 8 1 39833 18432 hf 0"),  # H200 NVL: the values tools/bench_gpu.sh measured
+    ("46068", "1 - 0 - - hf 0"),           # 46 GB cards: one run per GPU, the runners' own settings
+    ("0", "1 - 0 - - hf 0"),               # no nvidia-smi
 ])
 def test_gpu_defaults_give_the_h200_measurements_only_to_h200_class_cards(mib, expected):
     assert bash(f"gpu_defaults {mib}").stdout.strip() == expected
 
 
 @pytest.mark.parametrize("mib,preset,expected", [
-    ("143771", "", "slots=3 phys=8 mps=1 gpu=39833 lora=18432 gen=hf"),
-    ("46068", "", "slots=1 phys=unset mps=0 gpu=unset lora=unset gen=hf"),
-    ("143771", "PHYS_BS=16 SLOTS_PER_GPU=2 USE_MPS=0 GEN_BACKEND=vllm", "slots=2 phys=16 mps=0 gpu=39833 lora=18432 gen=vllm"),
+    ("143771", "", "slots=3 phys=8 mps=1 gpu=39833 lora=18432 gen=hf cgen=0"),
+    ("46068", "", "slots=1 phys=unset mps=0 gpu=unset lora=unset gen=hf cgen=0"),
+    ("143771", "PHYS_BS=16 SLOTS_PER_GPU=2 USE_MPS=0 GEN_BACKEND=vllm COMPILE_GEN=1",
+     "slots=2 phys=16 mps=0 gpu=39833 lora=18432 gen=vllm cgen=1"),
 ])
 def test_apply_card_defaults_fills_only_what_the_caller_left_unset(tmp_path, mib, preset, expected):
     bin_dir = fake_bin(tmp_path, **{"nvidia-smi": fake_smi(mib)})
     preset = f"export {preset};" if preset else ""          # what the caller's environment already holds
     out = subprocess.run(["bash", "-c", f'source {os.path.abspath(LIB)}; {preset} apply_card_defaults 0 1; '
                           'echo "slots=$SLOTS_PER_GPU phys=${PHYS_BS:-unset} mps=$USE_MPS '
-                          'gpu=${NEED_GPU_MB:-unset} lora=${NEED_LORA_MB:-unset} gen=${GEN_BACKEND:-unset}"'],
+                          'gpu=${NEED_GPU_MB:-unset} lora=${NEED_LORA_MB:-unset} gen=${GEN_BACKEND:-unset} '
+                          'cgen=${COMPILE_GEN:-unset}"'],
                          env={k: v for k, v in {**os.environ, "PATH": f"{bin_dir}:{os.environ['PATH']}"}.items()
                               if k not in ("PHYS_BS", "SLOTS_PER_GPU", "USE_MPS", "NEED_GPU_MB", "NEED_LORA_MB",
-                                           "GEN_BACKEND")},
+                                           "GEN_BACKEND", "COMPILE_GEN")},
                          capture_output=True, text=True)
     assert out.stdout.strip() == expected, out.stderr
 
@@ -168,3 +170,10 @@ def test_the_runners_hand_the_backend_on():
     ced = open("scripts/qwen/ced/run_ced_v2.sh").read()
     assert 'OPTS+=" --gen-backend ${GEN_BACKEND}"' in ced and 'PL_OPTS+=" --gen-backend ${GEN_BACKEND}"' in ced
     assert '--gen-backend "${GEN_BACKEND:-hf}"' in open("scripts/qwen/ced/run_cllora.sh").read()
+
+
+def test_the_ced_runner_records_compiled_generation_in_its_manifest():
+    script = open("scripts/qwen/ced/run_ced_v2.sh").read()
+    manifest_line = next(line for line in script.splitlines() if line.startswith("MANIFEST_CONFIG="))
+    assert ";cgen=${COMPILE_GEN};" in manifest_line
+    assert '[ "${COMPILE_GEN}" = "1" ] && OPTS+=" --compile-generation"' in script

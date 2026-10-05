@@ -199,6 +199,9 @@ Same experiments, same objectives, much less wall-clock. What changed and how to
     `./.venv-vllm` or `/venv/main` is used. To create one:
     `uv venv .venv-vllm --python 3.12 && uv pip install --python .venv-vllm vllm==0.27.1`.
   - `VLLM_GPU_GB` (default 10) caps each vLLM instance. `VLLM_EAGER=1` turns off CUDA graphs.
+- **Compiled sampling.** `COMPILE_GEN=1` (`--compile-generation`) samples inside training
+  steps (self-distillation in Ours, DistiLLM/AMiD student generation) with a static KV cache,
+  which transformers compiles. The settings and the random stream are unchanged.
 
 Measured on 1× H200 NVL (`bash tools/bench_gpu.sh h200`):
 
