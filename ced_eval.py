@@ -46,8 +46,9 @@ def eval_plan(mode, is_last, adaptive):
 
 def final_test_missing(args, done):
     """--eval-gen-mode final takes the test answers at the last update. When that evaluation
-    point never fired (eval_interval does not divide total_iters, or the task had no full
-    update), the trainer evaluates the test set once after training."""
+    point never fired (eval_interval does not divide total_iters), the trainer evaluates the
+    test set once after training. A split too small for one update is refused before training
+    (ced_step.updates_per_epoch)."""
     return args.eval_gen_mode == "final" and not done
 
 

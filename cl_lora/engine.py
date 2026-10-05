@@ -349,9 +349,11 @@ def epi_router_diagnostics(a, model, tok, device, router, streams, upto):
 
 
 def grouped_step_loss(a, model, mb, labels, task_id, mgr, tree, cur, device):
-    """The 4257d86 micro-step loss of train_task, per group of --loss-group-size rows, averaged.
-    Each group gets a token-mean CE, plus O-LoRA's orthogonality term, minus TreeLoRA's
-    regularizer. TreeLoRA's bandit steps once per group, as it stepped once per micro-step."""
+    """The 4257d86 micro-step loss of train_task, per group of --loss-group-size rows, summed and
+    divided by the groups of a full --batch-size batch, so each keeps its 1/accumulation weight
+    (a short last batch included). Each group gets a token-mean CE, plus O-LoRA's orthogonality
+    term, minus TreeLoRA's regularizer. TreeLoRA's bandit steps once per group, as it stepped
+    once per micro-step."""
     logits = model(**mb, use_cache=False).logits
     shifted, target = logits[:, :-1], labels[:, 1:]
     sig = tree_mod.signature_from_model(model, cur) if tree is not None else None
@@ -368,7 +370,7 @@ def grouped_step_loss(a, model, mb, labels, task_id, mgr, tree, cur, device):
                 prev = tree.tree_search(task_id, device)
                 loss = loss - tree.get_loss(sig, loss, task_id, prev)
         losses.append(loss)
-    return torch.stack(losses).mean()
+    return torch.stack(losses).sum() / (a.batch_size // a.loss_group_size)
 
 
 def train_task(a, model, ds, device, task_id, mgr, migu, tree, gates):

@@ -57,8 +57,10 @@ def lora_grads(model):
             if p.requires_grad and p.grad is not None}
 
 
-def reference_loss(args, ds, rows, student, teacher, tokenizer, mutate=None):
-    """4257d86: each group collated on its own at full width and scored as one micro-batch."""
+def reference_loss(args, ds, rows, student, teacher, tokenizer, mutate=None, n_groups=None):
+    """4257d86: each group collated on its own at full width and scored as one micro-batch.
+    Returns the sum of the micro-batch losses over n_groups (default: their mean), the weight
+    each micro-batch had in 4257d86's accumulation relative to one physical step."""
     from ced_step import group_slices
     engine, captured, capture = EngineShim(student), [], {"on": True}
     handles = add_hooks(student, captured, capture)
@@ -73,7 +75,8 @@ def reference_loss(args, ds, rows, student, teacher, tokenizer, mutate=None):
             out = ref.reference_micro_step(args, tokenizer, engine, teacher, mb, nmb, gen, "cpu", 1,
                                            None, {}, captured, capture)
             losses.append(out["loss"])
-        return torch.stack(losses).mean()
+        losses = torch.stack(losses)
+        return losses.mean() if n_groups is None else losses.sum() / n_groups
     finally:
         for h in handles:
             h.remove()
@@ -93,10 +96,13 @@ def new_loss(args, ds, rows, student, teacher, dynamic=False, mutate=None):
             h.remove()
 
 
-def check_equivalent(args, ds, rows, student, teacher, tokenizer, dynamic=False, mutate=None):
+def check_equivalent(args, ds, rows, student, teacher, tokenizer, dynamic=False, mutate=None, batch_size=None):
+    """batch_size: the physical --batch-size the rows came from (default: all of them, a full batch)."""
+    args = with_args(args, batch_size=batch_size or len(rows))
     student.train()
     student.zero_grad(set_to_none=True)
-    expected = reference_loss(args, ds, rows, student, teacher, tokenizer, mutate)
+    expected = reference_loss(args, ds, rows, student, teacher, tokenizer, mutate,
+                              n_groups=args.batch_size // args.loss_group_size)
     expected.backward()
     expected_grads = lora_grads(student)
     student.zero_grad(set_to_none=True)
@@ -123,8 +129,36 @@ def ace(tokenizer):
 def test_group_slices_cover_the_batch_in_order():
     from ced_step import group_slices
     assert group_slices(8, 2) == [slice(0, 2), slice(2, 4), slice(4, 6), slice(6, 8)]
+    # the last batch of an epoch: like 4257d86's last micro-batch, its last group can be short
+    assert group_slices(7, 2) == [slice(0, 2), slice(2, 4), slice(4, 6), slice(6, 7)]
+    assert group_slices(1, 2) == [slice(0, 1)]
     with pytest.raises(ValueError):
-        group_slices(8, 3)
+        group_slices(8, 0)
+
+
+def test_a_short_last_batch_keeps_each_micro_batch_weight(fewrel, student, teacher, tokenizer):
+    """The last batch of an epoch holds the leftover rows, maybe an odd number. 4257d86 trained
+    them as short micro-batches weighted like full ones (1/accumulation each), so the grouped
+    step divides its group losses by the full batch's group count, not by its own."""
+    args, ds = fewrel
+    check_equivalent(args, ds, pick_rows(ds, 2, 3), student, teacher, tokenizer, batch_size=8)  # groups 2+2+1 of 4
+
+
+def test_a_split_smaller_than_one_update_is_refused_up_front():
+    from ced_step import updates_per_epoch
+    assert updates_per_epoch(1280, 16, 1, 2) == 40
+    assert updates_per_epoch(891, 8, 1, 4) == 27          # int(27.84), as 4257d86 computed it
+    with pytest.raises(ValueError, match="fewer rows than one update"):
+        updates_per_epoch(20, 8, 1, 4)
+
+
+def test_both_trainers_count_updates_through_the_guard():
+    import inspect
+
+    import ced_finetune
+    import finetune
+    for trainer in (ced_finetune, finetune):
+        assert "updates_per_epoch(" in inspect.getsource(trainer.main)
 
 
 @pytest.mark.parametrize("kd_type", KD_TYPES)
@@ -187,10 +221,24 @@ def test_grouped_ce_matches_finetune_cross_entropy(fewrel, student):
     args, ds = fewrel
     rows = pick_rows(ds, 2, 6)
     mb, nmb, _, _, _ = collate(ds, rows, dynamic=True)
-    got = grouped_ce_loss(student, mb, nmb["label"], 2)
+    got = grouped_ce_loss(student, mb, nmb["label"], 2, n_groups=4)
     loss_func, expected = torch.nn.CrossEntropyLoss(), []
     for gs in group_slices(len(rows), 2):
         gmb, gnmb, _, _, _ = collate(ds, rows[gs], dynamic=False)
         logits = student(**gmb, use_cache=False).logits
         expected.append(loss_func(logits.float().view(-1, logits.shape[-1]), gnmb["label"].view(-1)))
     torch.testing.assert_close(got, torch.stack(expected).mean(), rtol=1e-5, atol=1e-7)
+
+
+def test_grouped_ce_on_a_short_last_batch_keeps_each_micro_batch_weight(fewrel, student):
+    from ced_step import group_slices, grouped_ce_loss
+    args, ds = fewrel
+    rows = pick_rows(ds, 2, 3)                      # the last 5 rows of an epoch, physical batch 8
+    mb, nmb, _, _, _ = collate(ds, rows, dynamic=True)
+    got = grouped_ce_loss(student, mb, nmb["label"], 2, n_groups=4)
+    loss_func, expected = torch.nn.CrossEntropyLoss(), []
+    for gs in group_slices(len(rows), 2):
+        gmb, gnmb, _, _, _ = collate(ds, rows[gs], dynamic=False)
+        logits = student(**gmb, use_cache=False).logits
+        expected.append(loss_func(logits.float().view(-1, logits.shape[-1]), gnmb["label"].view(-1)))
+    torch.testing.assert_close(got, torch.stack(expected).sum() / 4, rtol=1e-5, atol=1e-7)

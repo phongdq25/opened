@@ -88,7 +88,13 @@ DeepSpeed accumulates `G'` steps per update.
 `(1/G')·Σ_s (1/k)·Σ_j ∇L_sj`. These are equal because `G'·k = G`.
 
 The sampler yields the same permutation, so each group is one of today's micro-batches.
-The one difference: `drop_last` now drops up to `P−1` rows per epoch instead of `g−1`.
+Nothing is dropped, in either version. The last batch of an epoch holds the leftover
+`N mod P` rows; its groups (the last one short when `N mod g ≠ 0`, like today's last
+micro-batch) are divided by the full batch's group count `k`, so each keeps its `1/G`
+weight. The one difference: DeepSpeed counts physical batches, and an epoch's last batch
+can hold fewer than `k` groups, so after the first epoch the micro-batches are grouped into
+updates at different offsets: a few near each epoch boundary share an update with
+different neighbours than before.
 
 **Logical micro-batch per runner.** Each runner keeps its current `g`:
 

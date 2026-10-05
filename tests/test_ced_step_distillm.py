@@ -3,13 +3,14 @@ generations and seeded draws."""
 import random
 
 import numpy as np
+import pytest
 import torch
 
 import ced_losses
 import reference_ced_loss as ref
 from conftest import EngineShim
 from distillm import ReplayBuffer, SampleGenerator
-from test_ced_step import FEWREL, add_hooks, collate, load, lora_grads
+from test_ced_step import FEWREL, add_hooks, collate, load, lora_grads, with_args
 from test_ced_step_sd import scripted_generate
 
 ADAPTIVE = 0.9      # draws below it generate or sample
@@ -34,16 +35,18 @@ def filled_buffer(args, ds, sampler, engine, rows):
     return buffer
 
 
-def test_distillm_generation_matches_the_reference(tokenizer, student, teacher):
+@pytest.mark.parametrize("n_rows", [8, 7])          # 7: the short last batch of an epoch
+def test_distillm_generation_matches_the_reference(n_rows, tokenizer, student, teacher):
     from ced_step import ced_step_loss, distillm_replace_groups, group_slices
     args, ds = load(tokenizer, FEWREL, type="adaptive-srkl", student_gen=True, capacity=CAPACITY,
                     replay_ratio="constant")
+    args = with_args(args, batch_size=8)
     engine = EngineShim(student)
     engine.generate = scripted_generate(ds)
     sampler = SampleGenerator(args, tokenizer)
     replay = [i for i, f in enumerate(ds.replay_flags) if f]
     new = [i for i, f in enumerate(ds.replay_flags) if not f]
-    rows = [replay[0], new[0], replay[1], new[1], replay[2], new[2], replay[3], new[3]]
+    rows = [replay[0], new[0], replay[1], new[1], replay[2], new[2], replay[3], new[3]][:n_rows]
     seed = mixed_seed()
 
     def reference():
@@ -62,7 +65,7 @@ def test_distillm_generation_matches_the_reference(tokenizer, student, teacher):
                                                    None, {}, captured, capture)["loss"])
         for h in handles:
             h.remove()
-        return torch.stack(losses).mean(), buffer
+        return torch.stack(losses).sum() / (args.batch_size // args.loss_group_size), buffer
 
     def grouped():
         buffer = filled_buffer(args, ds, sampler, engine, replay[4:8] + new[4:6])

@@ -9,8 +9,11 @@ ced_finetune.py defines its objective per micro-batch:
 
 --loss-group-size keeps that definition while one forward covers --batch-size rows. Rows
 [0, g), [g, 2g), ... are each scored as one micro-batch of the code at 4257d86, and the step
-loss is their mean. With the gradient accumulation divided by the same factor, every update
-averages the same micro-batch losses as before (spec section 1).
+loss is their sum over the number of groups in a full physical batch. With the gradient
+accumulation divided by the same factor, every micro-batch keeps the weight it had before,
+1/accumulation (spec section 1). That includes the last batch of an epoch, which holds the
+leftover rows: its groups, the last one possibly short like 4257d86's last micro-batch, are
+divided by the full batch's group count too.
 
 Inside the step, logits are computed only over the label window, and the teacher runs only
 on the rows whose loss reads it.
@@ -26,16 +29,31 @@ from ced_losses import (IGNORE, compute_overall_span_loss, generate_replay_rows,
 
 
 def group_slices(n_rows, group_size):
-    if group_size < 1 or n_rows % group_size:
-        raise ValueError(f"a batch of {n_rows} rows is not a whole number of loss groups of {group_size}")
-    return [slice(start, start + group_size) for start in range(0, n_rows, group_size)]
+    """Rows [0, g), [g, 2g), ...: one slice per logical micro-batch. In the last batch of an
+    epoch the last slice can be short, as 4257d86's last micro-batch was."""
+    if group_size < 1:
+        raise ValueError(f"--loss-group-size must be positive, got {group_size}")
+    return [slice(start, min(start + group_size, n_rows)) for start in range(0, n_rows, group_size)]
+
+
+def updates_per_epoch(n_rows, batch_size, world_size, accumulation):
+    """Optimizer updates per epoch, counted as the trainers always have. A training split
+    smaller than one update is refused here: 4257d86 crashed on a division by zero in its
+    first step instead."""
+    rows_per_update = batch_size * world_size * accumulation
+    updates = int(n_rows / rows_per_update)
+    if updates < 1:
+        raise ValueError(f"the training split has {n_rows} rows, fewer rows than one update "
+                         f"({batch_size} rows x {world_size} GPUs x {accumulation} accumulation = "
+                         f"{rows_per_update}); lower --batch-size or --gradient-accumulation-steps")
+    return updates
 
 
 @dataclass
 class StepLoss:
-    loss: torch.Tensor          # mean over groups: what the engine backpropagates
-    lm_loss: torch.Tensor       # mean CE over groups (logging)
-    distil_loss: torch.Tensor   # mean over groups of the KD (+ span) term, 0 where a group has none (logging)
+    loss: torch.Tensor          # sum over groups / groups per full batch: what the engine backpropagates
+    lm_loss: torch.Tensor       # CE, summed the same way (logging)
+    distil_loss: torch.Tensor   # KD (+ span) term, summed the same way, 0 where a group has none (logging)
     sd_loss_sum: torch.Tensor   # sum of the groups' SD losses (logging)
     sd_groups: int              # groups that got an SD term
 
@@ -77,7 +95,8 @@ def _group_span_loss(args, gs, kd_rows, is_replay, use_pl_kd, model_batch, no_mo
 def ced_step_loss(args, model, teacher_model, model_batch, no_model_batch, captured, capture,
                   sd_batch=None, use_token_kd=True):
     """Forward the physical batch once, and the teacher only on the rows it is needed for.
-    Return 4257d86's per-micro-batch loss, averaged over groups of args.loss_group_size rows.
+    Return 4257d86's per-micro-batch loss for groups of args.loss_group_size rows, summed and
+    divided by the groups of a full --batch-size batch (the mean, except in a short last batch).
 
     captured: the list the span-loss hooks fill during the student forward ([None] first).
     capture: the dict whose "on" flag gates those hooks.
@@ -185,13 +204,16 @@ def ced_step_loss(args, model, teacher_model, model_batch, no_model_batch, captu
         distils.append(distil.detach())
 
     zero = torch.zeros((), device=device)
-    return StepLoss(torch.stack(losses).mean(), torch.stack(lms).mean(), torch.stack(distils).mean(),
+    n_full = args.batch_size // args.loss_group_size
+    return StepLoss(torch.stack(losses).sum() / n_full, torch.stack(lms).sum() / n_full,
+                    torch.stack(distils).sum() / n_full,
                     torch.stack(sd_terms).sum() if sd_terms else zero, len(sd_terms))
 
 
-def grouped_ce_loss(model, model_batch, label, group_size):
+def grouped_ce_loss(model, model_batch, label, group_size, n_groups):
     """finetune.py's CE (a token mean over each micro-batch) per group of `group_size` rows,
-    averaged. The LM head runs only over the label window."""
+    summed and divided by n_groups, the groups of a full --batch-size batch (the mean, except
+    in a short last batch). The LM head runs only over the label window."""
     start, end = label_window(label)
     logits = model(**model_batch, use_cache=False,
                    logits_to_keep=torch.arange(start, end, device=label.device)).logits
@@ -201,7 +223,7 @@ def grouped_ce_loss(model, model_batch, label, group_size):
         pos = lab[gs] != IGNORE
         terms.append(F.cross_entropy(logits[gs][pos].float(), lab[gs][pos]) if pos.any()
                      else torch.tensor(0.0, device=label.device))
-    return torch.stack(terms).mean()
+    return torch.stack(terms).sum() / n_groups
 
 
 def distillm_replace_groups(args, groups, model, student_generator, replay_buffer, model_batch, no_model_batch,

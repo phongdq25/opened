@@ -47,7 +47,7 @@ from peft import PeftModel
 from ed_eval import ed_evaluate
 from gen_config import generation_kwargs
 from ced_eval import evaluate, eval_plan, final_test_missing
-from ced_step import grouped_ce_loss
+from ced_step import grouped_ce_loss, updates_per_epoch
 
 torch.set_num_threads(4)
 
@@ -345,7 +345,8 @@ def finetune(args, tokenizer: AutoTokenizer, model: deepspeed.DeepSpeedEngine, o
                 raise NotImplementedError
             if teacher_model is None and not args.student_gen:
                 # CE per logical micro-batch (ced_step.grouped_ce_loss), logits over the label window
-                lm_loss = grouped_ce_loss(model, model_batch, no_model_batch["label"], args.loss_group_size)
+                lm_loss = grouped_ce_loss(model, model_batch, no_model_batch["label"], args.loss_group_size,
+                                          args.batch_size // args.loss_group_size)
             else:
                 logits = model(**model_batch, use_cache=False).logits
                 lm_loss = loss_func(logits.float().view(-1, logits.shape[-1]), no_model_batch["label"].view(-1))
@@ -503,7 +504,8 @@ def main():
     dp_world_size = dist.get_world_size()
     
     if args.do_train:
-        args.train_iters_per_epoch = int(len(dataset["train"]) / (args.batch_size * dp_world_size * args.gradient_accumulation_steps))
+        args.train_iters_per_epoch = updates_per_epoch(len(dataset["train"]), args.batch_size, dp_world_size,
+                                                       args.gradient_accumulation_steps)
         print_rank("Train iters per epoch", args.train_iters_per_epoch)
         if args.total_iters is None:
             args.total_iters = args.train_iters_per_epoch * args.epochs

@@ -48,7 +48,7 @@ from rouge_metric import compute_metrics
 from peft import PeftModel
 from ed_eval import ed_evaluate
 import ced_omask
-from ced_step import ced_step_loss, distillm_replace_groups, group_slices
+from ced_step import ced_step_loss, distillm_replace_groups, group_slices, updates_per_epoch
 from ced_losses import (
     get_distil_loss, select_batch_rows, replace_batch_rows, generate_replay_rows,
     SD_EOS_IDS, sd_lora_params, sd_ema_init, sd_ema_update, sd_ema_weights, sd_left_pad,
@@ -442,7 +442,7 @@ def finetune(args, tokenizer: AutoTokenizer, model: deepspeed.DeepSpeedEngine, o
             # SD sampling + EMA-teacher scoring come before the grad-tracking forwards
             sd_batch = None
             if args.ced_sd:
-                sd_win["steps"] += model_batch["input_ids"].size(0) // args.loss_group_size
+                sd_win["steps"] += -(-model_batch["input_ids"].size(0) // args.loss_group_size)   # a short last group counts
                 # warmup is an ablation knob (default 0); EMA keeps tracking the student during it
                 if use_sd and global_step > args.ced_sd_warmup * args.total_iters:
                     sd_batch, st = sd_prepare(args, tokenizer, model, sd_ema, gen_data, no_model_batch, device)
@@ -655,7 +655,8 @@ def main():
     dp_world_size = dist.get_world_size()
     
     if args.do_train:
-        args.train_iters_per_epoch = int(len(dataset["train"]) / (args.batch_size * dp_world_size * args.gradient_accumulation_steps))
+        args.train_iters_per_epoch = updates_per_epoch(len(dataset["train"]), args.batch_size, dp_world_size,
+                                                       args.gradient_accumulation_steps)
         print_rank("Train iters per epoch", args.train_iters_per_epoch)
         if args.total_iters is None:
             args.total_iters = args.train_iters_per_epoch * args.epochs

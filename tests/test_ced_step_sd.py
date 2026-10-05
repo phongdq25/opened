@@ -77,6 +77,7 @@ def run_reference(args, ds, rows, engine, teacher, tokenizer, ema):
     handles = add_hooks(engine.module, captured, capture)
     try:
         groups = group_slices(len(rows), args.loss_group_size)
+        n_groups = args.batch_size // args.loss_group_size       # a full physical batch's groups
         losses = []
         for gs in groups:
             mb, nmb, gen, _, _ = collate(ds, rows[gs], dynamic=False)
@@ -84,9 +85,9 @@ def run_reference(args, ds, rows, engine, teacher, tokenizer, ema):
             captured.append(None)
             out = ref.reference_micro_step(args, tokenizer, engine, teacher, mb, nmb, gen, "cpu", 1, ema,
                                            dict.fromkeys(SD_STATS, 0), captured, capture)
-            (out["loss"] / len(groups)).backward()
+            (out["loss"] / n_groups).backward()
             losses.append(out["loss"].detach())
-        return torch.stack(losses).mean()
+        return torch.stack(losses).sum() / n_groups
     finally:
         for h in handles:
             h.remove()
@@ -105,7 +106,9 @@ def run_new(args, ds, rows, engine, teacher, tokenizer, ema):
             h.remove()
 
 
-def check_sd(args, ds, rows, student, teacher, tokenizer, truncated=()):
+def check_sd(args, ds, rows, student, teacher, tokenizer, truncated=(), batch_size=None):
+    """batch_size: the physical --batch-size the rows came from (default: all of them)."""
+    args = with_args(args, batch_size=batch_size or len(rows))
     engine = EngineShim(student)
     engine.generate = scripted_generate(ds, truncated)
     ema = ced_losses.sd_ema_init(engine)
@@ -134,6 +137,12 @@ def test_a_group_whose_samples_are_all_truncated_gets_no_sd_term(sd_data, studen
     rows = pick_rows(ds, 3, 5)
     got = check_sd(args, ds, rows, student, teacher, tokenizer, truncated=set(rows[0:2]))
     assert got.sd_groups == 3 and torch.isfinite(got.loss)
+
+
+def test_self_distillation_on_a_short_last_batch_matches_the_reference(sd_data, student, teacher, tokenizer):
+    args, ds = sd_data
+    got = check_sd(args, ds, pick_rows(ds, 2, 3), student, teacher, tokenizer, batch_size=8)   # groups 2+2+1 of 4
+    assert got.sd_groups == 3
 
 
 def test_omission_mask_path_matches_the_reference(sd_data, student, teacher, tokenizer):
