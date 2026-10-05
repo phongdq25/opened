@@ -97,6 +97,11 @@ def add_data_args(parser: argparse.ArgumentParser):
     group.add_argument("--eval-ppl", action="store_true")
     group.add_argument("--eval-rw", action="store_true")
     group.add_argument("--eval-gen", action="store_true")
+    group.add_argument("--eval-gen-mode", type=str, default="every", choices=["every", "final"],
+                       help="every: dev and test answers after each epoch (historical); final: test answers "
+                            "after the last update only, and a loss-only dev pass for the adaptive methods")
+    group.add_argument("--eval-loss-batch-size", type=int, default=32,
+                       help="rows per chunk of the evaluation loss pass (32 = the historical eval batch)")
     
     group.add_argument("--only-prompt", action="store_true")
     return parser
