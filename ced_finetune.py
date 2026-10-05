@@ -48,6 +48,7 @@ from rouge_metric import compute_metrics
 from peft import PeftModel
 from ed_eval import ed_evaluate
 import ced_omask
+from ced_step import ced_step_loss, distillm_replace_groups, group_slices
 from ced_losses import (
     get_distil_loss, select_batch_rows, replace_batch_rows, generate_replay_rows,
     SD_EOS_IDS, sd_lora_params, sd_ema_init, sd_ema_update, sd_ema_weights, sd_left_pad,
@@ -301,7 +302,7 @@ def evaluate_loss(args, model, dataset, device):
     # materialises batch x seq x vocab (32 x 768 x 151936 x 4B = 14.9 GB at
     # eval_batch_size 32), which OOMs a 46 GB card before the first step.
     dataloader = DataLoader(
-        dataset, sampler=sampler, batch_size=args.batch_size,
+        dataset, sampler=sampler, batch_size=args.loss_group_size,
         num_workers=args.num_workers, collate_fn=dataset.collate
     )
     loss_func = nn.CrossEntropyLoss()
@@ -423,56 +424,12 @@ def finetune(args, tokenizer: AutoTokenizer, model: deepspeed.DeepSpeedEngine, o
                 else:
                     samp_threshold = adaptive_threshold * (1 - global_step / args.total_iters)
             
-            # DistiLLM generation is restricted to replay rows. New-task rows keep
-            # their gold CE targets and remain in the same mixed training batch.
+            # DistiLLM/AMiD: 4257d86's per-micro-batch generation decisions, one per loss group
             if args.student_gen:
-                r = np.random.uniform(0, 1)
-                replay_indices = no_model_batch["is_replay"].nonzero(as_tuple=False).flatten()
-                replay_count = len(replay_indices)
-                should_generate = (
-                    ("mixed" in args.type and r < args.mixed_alpha)
-                    or ("adaptive" in args.type and (
-                        r < samp_threshold
-                        or (r < adaptive_threshold and len(replay_buffer) < args.capacity)
-                    ))
-                )
-                should_sample = (
-                    "adaptive" in args.type
-                    and r < adaptive_threshold
-                    and len(replay_buffer) >= replay_count
-                )
-                if replay_count and should_generate:
-                    generated_model, generated_metadata, replay_gen_data = generate_replay_rows(
-                        args, student_generator, model, gen_data, no_model_batch, replay_indices
-                    )
-                    replay_buffer.move_to_memory(
-                        generated_model, generated_metadata, replay_gen_data
-                    )
-                    if "mixed" in args.type:
-                        generated_model, generated_metadata, _ = replay_buffer.sample(replay_count)
-                        generated_model, generated_metadata, _ = replay_buffer.move_to_device(
-                            generated_model, generated_metadata, None, device
-                        )
-                    model_batch = replace_batch_rows(model_batch, generated_model, replay_indices)
-                    no_model_batch = replace_batch_rows(
-                        no_model_batch, generated_metadata, replay_indices
-                    )
-                    print_rank(
-                        f"student-gen replay insert: {replay_count}, buffer={len(replay_buffer)}"
-                    )
-                elif replay_count and should_sample:
-                    sampled_model, sampled_metadata, sampled_gen = replay_buffer.sample(replay_count)
-                    sampled_model, sampled_metadata, sampled_gen = replay_buffer.move_to_device(
-                        sampled_model, sampled_metadata, sampled_gen, device
-                    )
-                    model_batch = replace_batch_rows(model_batch, sampled_model, replay_indices)
-                    no_model_batch = replace_batch_rows(
-                        no_model_batch, sampled_metadata, replay_indices
-                    )
-                    print_rank(
-                        f"student-gen replay sample: {replay_count}, buffer={len(replay_buffer)}"
-                    )
-                model.train()
+                model_batch, no_model_batch = distillm_replace_groups(
+                    args, group_slices(model_batch["input_ids"].size(0), args.loss_group_size), model,
+                    student_generator, replay_buffer, model_batch, no_model_batch, gen_data,
+                    samp_threshold, adaptive_threshold, device, log=print_rank)
 
             # --ced-sd-mix random: one KL term per update, token KD against the old-task model
             # or SD against the EMA teacher. Seeded by global_step so all micro-steps of an
@@ -485,133 +442,25 @@ def finetune(args, tokenizer: AutoTokenizer, model: deepspeed.DeepSpeedEngine, o
             # SD sampling + EMA-teacher scoring come before the grad-tracking forwards
             sd_batch = None
             if args.ced_sd:
-                sd_win["steps"] += 1
+                sd_win["steps"] += model_batch["input_ids"].size(0) // args.loss_group_size
                 # warmup is an ablation knob (default 0); EMA keeps tracking the student during it
                 if use_sd and global_step > args.ced_sd_warmup * args.total_iters:
                     sd_batch, st = sd_prepare(args, tokenizer, model, sd_ema, gen_data, no_model_batch, device)
                     for k in ("rows", "truncated", "unparsed", "kept", "masked_rec", "masked_tok"):
                         sd_win[k] += st[k]
-                    sd_win["active"] += int(sd_batch is not None)
-
-            outputs = model(**model_batch, use_cache=False)
-
-            logits = outputs.logits
-
-            # CED: route losses by replay flag. Replay samples (exemplars of old
-            # tasks) get KD + span loss against the previous-task teacher; new-task
-            # samples get plain CE. --ced-replay-mode kd_only drops CE on replay.
-            # --ced-kd-scope pl additionally applies KD on old-event token positions
-            # of pseudo-labeled rows (the only region where the old teacher is
-            # reliable on new-task data) — LwF adapted to generation.
-            is_replay = no_model_batch["is_replay"]  # (bs,) bool
-            has_replay = bool(is_replay.any().item())
-
-            old_token_mask = no_model_batch.get("old_token_mask")
-            use_pl_kd = (getattr(args, "ced_kd_scope", "replay") == "pl"
-                         and old_token_mask is not None)
-            pl_rows = None
-            has_kd = has_replay
-            if use_pl_kd:
-                pl_rows = old_token_mask.any(dim=1) & ~is_replay
-                has_kd = has_replay or bool(pl_rows.any().item())
-
-            # LwF: distill the old teacher on NEW-task rows' non-new-type tokens,
-            # with a small capped weight added ON TOP of the replay KD (never stealing
-            # from CE). Off by default (--ced-kd-ratio-new 0).
-            new_token_mask = no_model_batch.get("new_token_mask")
-            kd_ratio_new = getattr(args, "ced_kd_ratio_new", 0.0)
-            new_rows = ~is_replay
-            lwf_active = (teacher_model is not None and kd_ratio_new > 0.0
-                          and new_token_mask is not None and bool(new_rows.any().item()))
 
             if args.model_parallel:
                 raise NotImplementedError
 
-            ce_label = no_model_batch["label"]
-            if args.ced_replay_mode == "kd_only" and has_replay:
-                ce_label = ce_label.clone()
-                ce_label[is_replay] = -100
-            if (ce_label != -100).any():
-                lm_loss = loss_func(logits.float().reshape(-1, logits.shape[-1]), ce_label.view(-1))
-            else:
-                lm_loss = torch.tensor(0.0, device=logits.device)
-
-            distil_loss = torch.tensor(0.0, device=logits.device)
-            distil_loss_new = torch.tensor(0.0, device=logits.device)
-            if teacher_model is not None and (has_kd or lwf_active):
-                with torch.no_grad():
-                    teacher_model.eval()
-                    teacher_outputs = teacher_model(
-                        **model_batch,
-                        output_hidden_states=(args.w_span_loss != 0),
-                        use_cache=False,
-                    )
-                    teacher_logits = teacher_outputs.logits
-
-                if has_kd:
-                    kd_no_model_batch = dict(no_model_batch)
-                    kd_label = no_model_batch["label"].clone()
-                    keep = torch.zeros_like(kd_label, dtype=torch.bool)
-                    keep[is_replay] = True
-                    if use_pl_kd:
-                        keep |= old_token_mask[:, :kd_label.size(1)].to(keep.device) & pl_rows.unsqueeze(1)
-                    kd_label[~keep] = -100
-                    kd_no_model_batch["label"] = kd_label
-                    if use_token_kd and (kd_label != -100).any():
-                        distil_loss = get_distil_loss(args, teacher_logits, kd_no_model_batch, logits)
-
-                    if args.w_span_loss != 0:
-                        old_spans = no_model_batch.get("old_span_offsets")
-                        spans_offsets = []
-                        for i, (spans, flag) in enumerate(zip(
-                            no_model_batch["span_offsets"], is_replay.tolist()
-                        )):
-                            if flag:
-                                spans_offsets.append(spans)
-                            elif use_pl_kd and old_spans is not None:
-                                spans_offsets.append(old_spans[i])
-                            else:
-                                spans_offsets.append([])
-                        span_loss = compute_overall_span_loss(
-                            model_batch["attention_mask"],
-                            student_captured_hidden,
-                            teacher_outputs.hidden_states,
-                            no_model_batch["offset_mapping"],
-                            spans_offsets,
-                            args,
-                        )
-                        distil_loss = distil_loss + args.w_span_loss * span_loss
-
-                if lwf_active:
-                    # KD on new-task rows' answer tokens EXCEPT new-type-event tokens
-                    # (the teacher is unreliable exactly where the new types appear).
-                    lwf_no_model_batch = dict(no_model_batch)
-                    lwf_label = no_model_batch["label"].clone()
-                    keep_new = (new_rows.unsqueeze(1)
-                                & (lwf_label != -100)
-                                & ~new_token_mask[:, :lwf_label.size(1)].to(lwf_label.device))
-                    lwf_label[~keep_new] = -100
-                    lwf_no_model_batch["label"] = lwf_label
-                    if (lwf_label != -100).any():
-                        distil_loss_new = get_distil_loss(args, teacher_logits, lwf_no_model_batch, logits)
-
-            if has_kd:
-                loss = (1 - args.kd_ratio) * lm_loss + args.kd_ratio * distil_loss
-            else:
-                loss = lm_loss
-            if lwf_active:
-                w_new = min(kd_ratio_new, getattr(args, "ced_kd_new_cap", 0.3))
-                loss = loss + w_new * distil_loss_new
-
-            if sd_batch is not None:
-                capture["on"] = False
-                sd_loss = sd_loss_fn(args, model, sd_batch)
-                capture["on"] = True
-                loss = loss + args.ced_sd_weight * sd_loss
-            elif args.ced_sd:
-                # nothing to distill this step (warmup, or every sample dropped); keep a
-                # tensor so the all_reduce below runs on every rank and cannot hang
-                sd_loss = torch.zeros((), device=loss.device)
+            # CED loss per logical micro-batch (ced_step.py): replay rows get KD + span loss
+            # against the previous-task teacher, new-task rows plain CE, as before
+            step_loss = ced_step_loss(args, model, teacher_model, model_batch, no_model_batch,
+                                      student_captured_hidden, capture, sd_batch, use_token_kd)
+            loss = step_loss.loss
+            distil_loss = step_loss.distil_loss
+            if args.ced_sd:
+                sd_win["active"] += step_loss.sd_groups
+                sd_loss = step_loss.sd_loss_sum
 
             if args.lm_data_dir is not None:
                 assert args.lm_coef is not None
@@ -629,9 +478,9 @@ def finetune(args, tokenizer: AutoTokenizer, model: deepspeed.DeepSpeedEngine, o
             if args.ced_sd:
                 dist.all_reduce(sd_loss, dist.ReduceOp.SUM, group=dp_group)
                 total_sd_loss += sd_loss.item() / dp_world_size
-                if sd_batch is not None:
-                    total_sd_len += sd_batch["resp_len"]
-                    total_sd_ent += sd_batch["t_entropy"]
+                if sd_batch is not None and step_loss.sd_groups:
+                    total_sd_len += sd_batch["resp_len"] * step_loss.sd_groups
+                    total_sd_ent += sd_batch["t_entropy"] * step_loss.sd_groups
 
             global_distil_loss = 0
             if teacher_model is not None:
@@ -759,6 +608,15 @@ def main():
     torch.backends.cudnn.enabled = False
     
     args = get_args()
+    if args.loss_group_size is None:
+        args.loss_group_size = args.batch_size
+    if args.batch_size % args.loss_group_size:
+        raise ValueError(f"--batch-size {args.batch_size} is not a multiple of --loss-group-size {args.loss_group_size}")
+    if args.loss_group_size != args.batch_size and args.lm_data_dir is not None:
+        raise ValueError("--lm-data-dir needs --loss-group-size equal to --batch-size")
+    # padding length changes the span loss (its token weights average over padded queries), and the
+    # DistiLLM replay buffer stores --max-length-wide rows: both keep fixed padding
+    args.dynamic_pad_effective = args.dynamic_pad and args.w_span_loss == 0 and not args.student_gen
     initialize(args)
     
     if dist.get_rank() == 0:

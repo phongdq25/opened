@@ -47,6 +47,7 @@ from peft import PeftModel
 from ed_eval import ed_evaluate
 from gen_config import generation_kwargs
 from ced_eval import evaluate, eval_plan, final_test_missing
+from ced_step import grouped_ce_loss
 
 torch.set_num_threads(4)
 
@@ -340,12 +341,13 @@ def finetune(args, tokenizer: AutoTokenizer, model: deepspeed.DeepSpeedEngine, o
                     
                 model.train()
 
-            outputs = model(**model_batch, use_cache=False)
-            
-            logits = outputs.logits
             if args.model_parallel:
                 raise NotImplementedError
+            if teacher_model is None and not args.student_gen:
+                # CE per logical micro-batch (ced_step.grouped_ce_loss), logits over the label window
+                lm_loss = grouped_ce_loss(model, model_batch, no_model_batch["label"], args.loss_group_size)
             else:
+                logits = model(**model_batch, use_cache=False).logits
                 lm_loss = loss_func(logits.float().view(-1, logits.shape[-1]), no_model_batch["label"].view(-1))
             
             if teacher_model is not None:
@@ -456,6 +458,13 @@ def main():
     torch.backends.cudnn.enabled = False
     
     args = get_args()
+    if args.loss_group_size is None:
+        args.loss_group_size = args.batch_size
+    if args.batch_size % args.loss_group_size:
+        raise ValueError(f"--batch-size {args.batch_size} is not a multiple of --loss-group-size {args.loss_group_size}")
+    if args.loss_group_size != args.batch_size and (args.teacher_model_path or args.student_gen or args.lm_data_dir):
+        raise ValueError("--loss-group-size below --batch-size is only implemented for plain CE training")
+    args.dynamic_pad_effective = args.dynamic_pad and not args.student_gen
     initialize(args)
     
     if dist.get_rank() == 0:

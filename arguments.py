@@ -136,6 +136,9 @@ def add_hp_args(parser: argparse.ArgumentParser):
                        help='total number of epochs to train over all training runs')
     group.add_argument('--training-epochs', type=int, default=10000)
     group.add_argument("--gradient-accumulation-steps", type=int, default=1)
+    group.add_argument("--loss-group-size", type=int, default=None,
+                       help="rows per logical micro-batch, the unit the CE/KD loss is defined over; "
+                            "--batch-size (the physical batch) must be a multiple of it (default: --batch-size)")
     group.add_argument("--gradient-checkpointing", action="store_true")
     group.add_argument("--attn-dtype", default=None)
     
