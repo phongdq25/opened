@@ -46,7 +46,7 @@ from rouge_metric import compute_metrics
 from peft import PeftModel
 from ed_eval import ed_evaluate
 from gen_config import generation_kwargs
-from ced_eval import evaluate, eval_plan, final_test_missing
+from ced_eval import check_gen_backend, evaluate, eval_plan, final_test_missing
 from ced_step import grouped_ce_loss, updates_per_epoch
 
 torch.set_num_threads(4)
@@ -520,6 +520,7 @@ def main():
             args.eval_interval = args.train_iters_per_epoch
     
     model, optimizer, lr_scheduler = setup_model_and_optimizer(args, ds_config, device, set_optim=args.do_train)
+    check_gen_backend(args, model, tokenizer)     # --gen-backend vllm: refuse before the first update
     
     if args.teacher_model_type is None:
         args.teacher_model_type = args.model_type

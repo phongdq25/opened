@@ -56,7 +56,7 @@ from ced_losses import (
     sd_loss_fn, compute_token_weights, prepare_span_indices_and_weights, get_span_loss,
     compute_overall_span_loss, CKA_MIN_SPANS, cka_span_loss, compute_hidden_span_loss)
 from gen_config import generation_kwargs
-from ced_eval import evaluate, eval_plan, final_test_missing
+from ced_eval import check_gen_backend, evaluate, eval_plan, final_test_missing
 
 torch.set_num_threads(4)
 
@@ -671,6 +671,7 @@ def main():
             args.eval_interval = args.train_iters_per_epoch
     
     model, optimizer, lr_scheduler = setup_model_and_optimizer(args, ds_config, device, set_optim=args.do_train)
+    check_gen_backend(args, model, tokenizer)     # --gen-backend vllm: refuse before the first update
     
     if args.teacher_model_type is None:
         args.teacher_model_type = args.model_type

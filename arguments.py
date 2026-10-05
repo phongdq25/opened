@@ -250,6 +250,9 @@ def add_gen_args(parser: argparse.ArgumentParser):
                        help="use every GenerationConfig as written; by default transformers fills fields "
                             "left at their library default from the model's generation_config.json (see "
                             "gen_config.py), which is how all runs so far were made")
+    group.add_argument("--gen-backend", choices=["hf", "vllm"], default="hf",
+                       help="hf: answers come from model.generate(); vllm: from tools/vllm_generate.py in the "
+                            "vLLM environment, with the settings generate() would use (gen_backend.py)")
 
     return parser
 

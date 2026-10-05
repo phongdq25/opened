@@ -11,6 +11,7 @@ historical schedule; final generates answers only for the test set after the las
 """
 import json
 import os
+import shutil
 from dataclasses import dataclass
 
 import torch
@@ -23,6 +24,8 @@ from transformers import GenerationConfig
 
 from ced_losses import label_window
 from ed_eval import ed_evaluate
+from gen_backend import (export_for_vllm, find_vllm_python, resolve_generation_config, row_seed, run_vllm,
+                         unpadded_prompts, vllm_params)
 from gen_config import generation_kwargs
 from rouge_metric import compute_metrics
 from utils import all_gather, get_rank, print_rank, save_rank
@@ -59,6 +62,44 @@ def _loader(args, dataset, batch_size):
                       num_workers=args.num_workers, collate_fn=dataset.collate)
 
 
+def eval_generation_config(args, tokenizer):
+    """The GenerationConfig evaluate() hands to generate(); transformers then fills in the model's
+    defaults (gen_config.py)."""
+    return GenerationConfig(
+        do_sample=args.do_sample, top_p=args.top_p, top_k=args.top_k, temperature=args.temperature,
+        repetition_penalty=args.repetition_penalty, max_length=args.max_length, min_length=None,
+        eos_token_id=[tokenizer.eos_token_id, 151643], pad_token_id=tokenizer.eos_token_id,
+        return_dict_in_generate=True, output_scores=False)
+
+
+def check_gen_backend(args, model, tokenizer):
+    """With --gen-backend vllm, refuse to start a run whose evaluation vLLM could not do."""
+    if getattr(args, "gen_backend", "hf") != "vllm":
+        return
+    if dist.get_world_size() != 1:
+        raise ValueError("--gen-backend vllm evaluates in one process: run with world size 1")
+    args.vllm_py, args.vllm_version = find_vllm_python()
+    vllm_params(resolve_generation_config(model, eval_generation_config(args, tokenizer), **generation_kwargs(args)))
+    print_rank(f"generation backend: vLLM {args.vllm_version} ({args.vllm_py})")
+
+
+def _vllm_response_ids(args, model, loader, generation_config, split, epoch):
+    """Each row's answer token IDs from vLLM, with the settings generate() would decode with."""
+    requests = []
+    for _, _, gen_data, _, _ in loader:
+        width = gen_data["input_ids"].size(1)
+        for prompt in unpadded_prompts(gen_data["input_ids"], gen_data["attention_mask"]):
+            requests.append({"prompt_token_ids": prompt, "max_tokens": args.max_length - width,
+                             "seed": row_seed(args.seed, split, epoch, len(requests))})
+    params = vllm_params(resolve_generation_config(model, generation_config, **generation_kwargs(args)))
+    work_dir = os.path.join(args.save, "vllm_tmp")
+    model_dir, lora_dir, rank = export_for_vllm(model, args.model_path, work_dir)
+    outputs = run_vllm(work_dir, model_dir, requests, params, lora_dir=lora_dir, max_lora_rank=rank,
+                       max_model_len=args.max_length, vllm_py=getattr(args, "vllm_py", None))
+    shutil.rmtree(work_dir, ignore_errors=True)
+    return [output["token_ids"] for output in outputs]
+
+
 def evaluate(args, tokenizer, model, dataset, split, epoch, device, adaptive_threshold=None, generate=True):
     dp_world_size = dist.get_world_size()
     loss_func = nn.CrossEntropyLoss()
@@ -80,29 +121,29 @@ def evaluate(args, tokenizer, model, dataset, split, epoch, device, adaptive_thr
 
     responses = None
     if generate and args.eval_gen:
-        generation_config = GenerationConfig(
-            do_sample=args.do_sample, top_p=args.top_p, top_k=args.top_k, temperature=args.temperature,
-            repetition_penalty=args.repetition_penalty, max_length=args.max_length, min_length=None,
-            eos_token_id=[tokenizer.eos_token_id, 151643], pad_token_id=tokenizer.eos_token_id,
-            return_dict_in_generate=True, output_scores=False)
+        generation_config = eval_generation_config(args, tokenizer)
         loader = _loader(args, dataset, args.eval_batch_size)
-        all_response_ids = []
-        with torch.no_grad():
-            for it, (_, _, gen_data, _, _) in enumerate(tqdm(loader, desc="Evaluating",
-                                                             disable=(dist.get_rank() != 0))):
-                print_rank(f"{it}/{len(loader)}")
-                gen_data = {k: v.to(device) for k, v in gen_data.items()}
-                width = gen_data["input_ids"].size(1)
-                sequences = model.generate(**gen_data, generation_config=generation_config,
-                                           max_new_tokens=args.max_length - width,
-                                           **generation_kwargs(args)).sequences
-                sequences = F.pad(sequences, (0, args.max_length - sequences.shape[1]),
-                                  value=tokenizer.pad_token_id)
-                all_response_ids.append(sequences[:, width:])
-        all_response_ids = torch.cat(all_response_ids, dim=0)
-        all_response_ids = all_gather(all_response_ids, dim=1, world_size=dp_world_size, op="stack")
-        all_response_ids = all_response_ids.view(-1, all_response_ids.size(-1))
-        responses = tokenizer.batch_decode(all_response_ids, skip_special_tokens=True)
+        if getattr(args, "gen_backend", "hf") == "vllm":
+            response_ids = _vllm_response_ids(args, model, loader, generation_config, split, epoch)
+            responses = tokenizer.batch_decode(response_ids, skip_special_tokens=True)
+        else:
+            all_response_ids = []
+            with torch.no_grad():
+                for it, (_, _, gen_data, _, _) in enumerate(tqdm(loader, desc="Evaluating",
+                                                                 disable=(dist.get_rank() != 0))):
+                    print_rank(f"{it}/{len(loader)}")
+                    gen_data = {k: v.to(device) for k, v in gen_data.items()}
+                    width = gen_data["input_ids"].size(1)
+                    sequences = model.generate(**gen_data, generation_config=generation_config,
+                                               max_new_tokens=args.max_length - width,
+                                               **generation_kwargs(args)).sequences
+                    sequences = F.pad(sequences, (0, args.max_length - sequences.shape[1]),
+                                      value=tokenizer.pad_token_id)
+                    all_response_ids.append(sequences[:, width:])
+            all_response_ids = torch.cat(all_response_ids, dim=0)
+            all_response_ids = all_gather(all_response_ids, dim=1, world_size=dp_world_size, op="stack")
+            all_response_ids = all_response_ids.view(-1, all_response_ids.size(-1))
+            responses = tokenizer.batch_decode(all_response_ids, skip_special_tokens=True)
 
     if get_rank() == 0:
         res = {}
