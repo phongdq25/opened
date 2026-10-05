@@ -20,7 +20,8 @@ from dataclasses import dataclass
 import torch
 import torch.nn.functional as F
 
-from ced_losses import IGNORE, compute_overall_span_loss, get_distil_loss, label_window
+from ced_losses import (IGNORE, compute_overall_span_loss, get_distil_loss, label_window, sd_group_loss,
+                        sd_student_logits)
 
 
 def group_slices(n_rows, group_size):
@@ -128,6 +129,13 @@ def ced_step_loss(args, model, teacher_model, model_batch, no_model_batch, captu
                                   use_cache=False, logits_to_keep=window)
         t_logits, t_hidden = t_out.logits, t_out.hidden_states
 
+    sd_logits = sd_rows = None
+    if sd_batch is not None:
+        capture["on"] = False           # the span loss must not see the SD forward's hidden states
+        sd_logits = sd_student_logits(model, sd_batch)
+        capture["on"] = True
+        sd_rows = torch.as_tensor(sd_batch["rows"], device=device)
+
     losses, lms, distils, sd_terms = [], [], [], []
     for j, gs in enumerate(groups):
         lab_g, rep_g = lab[gs], is_replay[gs]
@@ -166,6 +174,11 @@ def ced_step_loss(args, model, teacher_model, model_batch, no_model_batch, captu
         loss = (1 - args.kd_ratio) * lm + args.kd_ratio * distil if has_kd[j] else lm
         if lwf[j]:
             loss = loss + min(kd_ratio_new, getattr(args, "ced_kd_new_cap", 0.3)) * distil_new
+        if sd_logits is not None:
+            sd_g = sd_group_loss(args, sd_logits, sd_batch, (sd_rows >= gs.start) & (sd_rows < gs.stop))
+            if sd_g is not None:
+                loss = loss + args.ced_sd_weight * sd_g
+                sd_terms.append(sd_g.detach())
         losses.append(loss)
         lms.append(lm.detach())
         distils.append(distil.detach())

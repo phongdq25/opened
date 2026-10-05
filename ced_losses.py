@@ -243,8 +243,7 @@ def sd_prepare(args, tokenizer, model, ema, gen_data, no_model_batch, device):
 
     t_ids, t_mask, t_pos, label = sd_pack(t_prompts, responses, SD_EOS_IDS[0], device)
     with torch.no_grad(), sd_ema_weights(model, ema):
-        t_logits = model(input_ids=t_ids, attention_mask=t_mask, use_cache=False).logits
-        t_logits = sd_gather(t_logits, t_pos)
+        t_logits = sd_window_logits(model, t_ids, t_mask, t_pos, label)
     model.train()
 
     s_ids, s_mask, s_pos, _ = sd_pack(prompts, responses, SD_EOS_IDS[0], device)
@@ -257,7 +256,7 @@ def sd_prepare(args, tokenizer, model, ema, gen_data, no_model_batch, device):
         if not (label != -100).any():
             return None, stats
     return {"ids": s_ids, "mask": s_mask, "pos": s_pos, "label": label, "t_logits": t_logits,
-            "t_entropy": sd_teacher_entropy(t_logits, label),
+            "rows": kept_rows, "t_entropy": sd_teacher_entropy(t_logits, label),
             "resp_len": sum(len(r) for r in responses) / len(responses)}, stats
 
 
@@ -295,6 +294,36 @@ def sd_loss_fn(args, model, sd):
     if args.ced_sd_div == "rkl":
         return reverse_kl(logits, sd["t_logits"], batch)
     return forward_kl(logits, sd["t_logits"], batch)
+
+
+def sd_window_logits(model, ids, mask, pos, label):
+    """sd_gather(model(ids).logits, pos), with the LM head run only over the columns that the
+    valid entries of pos (label != -100) cover. Entries past a row's response are clamped
+    into that window; nothing reads them."""
+    valid = label != IGNORE
+    lo = int(pos[valid].min()) if valid.any() else 0
+    hi = int(pos[valid].max()) + 1 if valid.any() else 1
+    logits = model(input_ids=ids, attention_mask=mask, use_cache=False,
+                   logits_to_keep=torch.arange(lo, hi, device=ids.device)).logits
+    return sd_gather(logits, (pos - lo).clamp(0, hi - lo - 1))
+
+
+def sd_student_logits(model, sd):
+    """The student's logits on the sampled responses of every kept row (the SD forward)."""
+    return sd_window_logits(model, sd["ids"], sd["mask"], sd["pos"], sd["label"])
+
+
+def sd_group_loss(args, s_logits, sd, in_group):
+    """The SD loss 4257d86 computes for a micro-batch whose kept rows are `in_group`. Returns
+    None when that micro-batch has nothing left to distill (no kept row, or every token
+    masked): 4257d86's sd_prepare returns None there, and the micro-batch gets no SD term."""
+    label = sd["label"][in_group]
+    if not (label != IGNORE).any():
+        return None
+    batch = {"label": label}
+    if args.ced_sd_div == "rkl":
+        return reverse_kl(s_logits[in_group], sd["t_logits"][in_group], batch)
+    return forward_kl(s_logits[in_group], sd["t_logits"][in_group], batch)
 def compute_token_weights(hidden_state, attention_mask):
     std = hidden_state.std(dim=-1, keepdim=True) + 1e-5
     Q = hidden_state / std
