@@ -23,10 +23,10 @@ run_active () {
 #      ("-" = leave unset)
 # The values tools/bench_gpu.sh measured on 1x H200 NVL (README) go to H200-class cards only;
 # smaller cards keep one run per GPU and the runners' own settings (PHYS_BS = --bs, no MPS).
-# GEN_BACKEND stays hf until the vLLM end-to-end check passes (plan 2026-10-06-vllm-generation, Task 8);
+# GEN_BACKEND vllm on H200-class cards since the end-to-end TACRED check (README), hf elsewhere;
 # COMPILE_GEN stays 0 until the training check passes (plan 2026-10-06-compiled-sd-generation, Task 3).
 gpu_defaults () {
-    if [ "${1:-0}" -ge 130000 ]; then echo "3 8 1 39833 18432 hf 0"; else echo "1 - 0 - - hf 0"; fi
+    if [ "${1:-0}" -ge 130000 ]; then echo "3 8 1 39833 18432 vllm 0"; else echo "1 - 0 - - hf 0"; fi
 }
 
 # apply_card_defaults [<gpu id> ...]: fill in SLOTS_PER_GPU, PHYS_BS, USE_MPS, NEED_GPU_MB, NEED_LORA_MB,
@@ -42,6 +42,11 @@ apply_card_defaults () {
     [ "${d_phys}" = "-" ] || export PHYS_BS=${PHYS_BS:-${d_phys}}
     [ "${d_gpu}" = "-" ] || export NEED_GPU_MB=${NEED_GPU_MB:-${d_gpu}}
     [ "${d_lora}" = "-" ] || export NEED_LORA_MB=${NEED_LORA_MB:-${d_lora}}
+    # vLLM only where gen_backend.find_vllm_python() finds an environment for it
+    if [ "${d_gen}" = "vllm" ] && ! "${PY:-python3}" -c "from gen_backend import find_vllm_python; find_vllm_python()" \
+            > /dev/null 2>&1; then
+        d_gen=hf
+    fi
     export GEN_BACKEND=${GEN_BACKEND:-${d_gen}}
     export COMPILE_GEN=${COMPILE_GEN:-${d_cgen}}
 }

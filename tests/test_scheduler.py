@@ -34,7 +34,10 @@ def train_step_line(tmp_path, card_mib):
     env = {k: v for k, v in os.environ.items()
            if k not in ("POOL_GPUS", "SLOTS_PER_GPU", "PHYS_BS", "USE_MPS", "NEED_GPU_MB", "NEED_LORA_MB",
                         "GEN_BACKEND", "COMPILE_GEN")}
-    env.update(DRY="1", DS="fewrel", PERMS="0", SKIP_INSTALL="1", PATH=f"{bin_dir}:{env['PATH']}")
+    vllm_py = bin_dir / "vllm_python"            # a vLLM environment for gen_backend.find_vllm_python()
+    vllm_py.write_text('#!/bin/bash\nif [ "$1" = "-c" ]; then echo "VLLM_VERSION 0.27.1"; exit 0; fi\n')
+    vllm_py.chmod(0o755)
+    env.update(DRY="1", DS="fewrel", PERMS="0", SKIP_INSTALL="1", PATH=f"{bin_dir}:{env['PATH']}", VLLM_PY=str(vllm_py))
     proc = subprocess.Popen(["bash", "project_commands.sh"], env=env, stdout=subprocess.PIPE,
                             stderr=subprocess.STDOUT, text=True, start_new_session=True)
     try:
@@ -49,7 +52,7 @@ def train_step_line(tmp_path, card_mib):
 
 def test_h200_class_cards_get_the_measured_packing_spread_over_the_cards(tmp_path):
     assert train_step_line(tmp_path, 143771) == \
-        "=== 3. train 16 jobs on gpus 0 1 0 1 0 1 (PHYS_BS=8 USE_MPS=1 GEN_BACKEND=hf COMPILE_GEN=0) ==="
+        "=== 3. train 16 jobs on gpus 0 1 0 1 0 1 (PHYS_BS=8 USE_MPS=1 GEN_BACKEND=vllm COMPILE_GEN=0) ==="
 
 
 def test_smaller_cards_keep_one_run_per_gpu_and_the_runner_defaults(tmp_path):

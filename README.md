@@ -198,7 +198,26 @@ Same experiments, same objectives, much less wall-clock. What changed and how to
   - vLLM runs in its own environment. `VLLM_PY` points at its Python; otherwise
     `./.venv-vllm` or `/venv/main` is used. To create one:
     `uv venv .venv-vllm --python 3.12 && uv pip install --python .venv-vllm vllm==0.27.1`.
-  - `VLLM_GPU_GB` (default 10) caps each vLLM instance. `VLLM_EAGER=1` turns off CUDA graphs.
+  - `VLLM_GPU_GB` (default 10) is each vLLM instance's memory budget; the instance holds about
+    12 GB on the card at the default. `VLLM_EAGER=1` turns off CUDA graphs.
+  - On H200-class cards `GEN_BACKEND` defaults to `vllm` when a vLLM environment is found
+    (`scripts/qwen/lib.sh`), and to `hf` everywhere else. Measured against Hugging Face on
+    1× H200 NVL, next to running jobs (`tools/gen_parity.py`):
+
+    | check | result |
+    |---|---|
+    | CL-LoRA greedy, IncLoRA TACRED task 9 (1,240 rows) | 98.95% identical answers, F1 63.06 → 63.31 |
+    | Distillation path, strict greedy, FewRel task 0 (1,120 rows) | 99.02% identical answers, F1 89.29 → 89.55 |
+    | Distillation path, sampled at T=0.5, 3 seeds each | mean F1 89.16 (spread 0.89) → 89.21 (spread 0.49) |
+    | Pseudo-labels, ACE task 1, confidence filter on | 99.15% identical rows, the same 17 pseudo-labels |
+    | Answer generation, FewRel task 9 (11,200 rows) | 2,503 s → 572 s |
+    | Answer generation, FewRel task 0 (1,120 rows) | 177-279 s → 113 s |
+
+    End to end, TACRED order 0, all 10 tasks, against the round-1 runs above: RKL final-task
+    trigger F1 65.56 → 65.56, IncLoRA 63.06 → 62.98. Peak memory per run, trainer plus its vLLM:
+    RKL 32.3 GiB, IncLoRA 23.7 GiB. The wall-clock of that run (5,071 s and 4,912 s) is not
+    comparable with the round-1 table: the card also ran three FewRel jobs and the checks
+    above at 100% utilization.
 - **Compiled sampling.** `COMPILE_GEN=1` (`--compile-generation`) samples inside training
   steps (self-distillation in Ours, DistiLLM/AMiD student generation) with a static KV cache,
   which transformers compiles. The settings and the random stream are unchanged.
