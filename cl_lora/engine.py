@@ -36,6 +36,7 @@ from peft import (
 )
 
 from ed_eval import ed_evaluate
+from ced_step import group_slices
 from cl_lora.multi_adapter import CLLoRAManager, lora_layers
 from cl_lora import migu as migu_mod
 from cl_lora import treelora as tree_mod
@@ -72,6 +73,8 @@ def parse_args():
     p.add_argument("--batch-size", type=int, default=2)
     p.add_argument("--eval-batch-size", type=int, default=16)
     p.add_argument("--grad-accum", type=int, default=16)
+    p.add_argument("--loss-group-size", type=int, default=None,
+                   help="rows per logical micro-batch; the CE is a token mean per group (default: --batch-size)")
     p.add_argument("--warmup-ratio", type=float, default=0.1)
     p.add_argument("--clip-grad", type=float, default=1.0)
     p.add_argument("--max-length", type=int, default=768)
@@ -256,7 +259,7 @@ def _collect_input_cov(a, model, ds, device):
     """Run a small calibration pass; return an ActivationCollector keyed by LoRA-layer name."""
     layers = {name: mod.base_layer for name, mod in lora_layers(model) if hasattr(mod, "base_layer")}
     coll = ActivationCollector(layers)
-    loader = DataLoader(ds, batch_size=a.batch_size, shuffle=True, collate_fn=ds.collate_train)
+    loader = DataLoader(ds, batch_size=a.loss_group_size, shuffle=True, collate_fn=ds.collate_train)
     model.eval()
     seen = 0
     for mb, _ in loader:
@@ -345,6 +348,29 @@ def epi_router_diagnostics(a, model, tok, device, router, streams, upto):
     }
 
 
+def grouped_step_loss(a, model, mb, labels, task_id, mgr, tree, cur, device):
+    """The 4257d86 micro-step loss of train_task, per group of --loss-group-size rows, averaged.
+    Each group gets a token-mean CE, plus O-LoRA's orthogonality term, minus TreeLoRA's
+    regularizer. TreeLoRA's bandit steps once per group, as it stepped once per micro-step."""
+    logits = model(**mb, use_cache=False).logits
+    shifted, target = logits[:, :-1], labels[:, 1:]
+    sig = tree_mod.signature_from_model(model, cur) if tree is not None else None
+    losses = []
+    for gs in group_slices(labels.size(0), a.loss_group_size):
+        loss = torch.nn.functional.cross_entropy(
+            shifted[gs].reshape(-1, logits.size(-1)).float(), target[gs].reshape(-1))
+        if mgr is not None and a.cl_method in ORTH:
+            loss = loss + mgr.orth_loss(cur)
+        if tree is not None:
+            tree.step()
+            tree.insert_grad(sig)
+            if task_id > 0:
+                prev = tree.tree_search(task_id, device)
+                loss = loss - tree.get_loss(sig, loss, task_id, prev)
+        losses.append(loss)
+    return torch.stack(losses).mean()
+
+
 def train_task(a, model, ds, device, task_id, mgr, migu, tree, gates):
     sampler = DistributedSampler(
         ds,
@@ -375,7 +401,8 @@ def train_task(a, model, ds, device, task_id, mgr, migu, tree, gates):
         num_training_steps=total_updates,
     )
     if tree is not None:
-        tree.new_epoch_init(micro_steps_per_epoch * a.epochs)
+        # the bandit schedule counts logical micro-steps (loss groups), as before
+        tree.new_epoch_init(micro_steps_per_epoch * (a.batch_size // a.loss_group_size) * a.epochs)
     cur = mgr.task_adapters[-1] if mgr is not None else None
     model.train()
     opt.zero_grad(set_to_none=True)
@@ -388,18 +415,7 @@ def train_task(a, model, ds, device, task_id, mgr, migu, tree, gates):
             labels = nmb["label"].to(device)
             if gates is not None:
                 gates.set_batch_gates(mb["input_ids"], mb["attention_mask"])
-            logits = model(**mb, use_cache=False).logits
-            loss = torch.nn.functional.cross_entropy(
-                logits[:, :-1].reshape(-1, logits.size(-1)).float(), labels[:, 1:].reshape(-1))
-            if mgr is not None and a.cl_method in ORTH:
-                loss = loss + mgr.orth_loss(cur)
-            if tree is not None:
-                tree.step()
-                sig = tree_mod.signature_from_model(model, cur)
-                tree.insert_grad(sig)
-                if task_id > 0:
-                    prev = tree.tree_search(task_id, device)
-                    loss = loss - tree.get_loss(sig, loss, task_id, prev)
+            loss = grouped_step_loss(a, model, mb, labels, task_id, mgr, tree, cur, device)
             (loss / a.grad_accum).backward()
             if migu is not None:
                 migu.mask_grads()
@@ -464,6 +480,13 @@ def eval_task(a, model, tok, device, upto, mgr, router=None, gates=None):
 
 def main():
     a = parse_args()
+    if a.loss_group_size is None:
+        a.loss_group_size = a.batch_size
+    if a.batch_size % a.loss_group_size:
+        raise ValueError(f"--batch-size {a.batch_size} is not a multiple of --loss-group-size {a.loss_group_size}")
+    if a.cl_method == "migu" and a.loss_group_size != a.batch_size:
+        raise ValueError("MIGU builds its gradient mask from each step's activations: "
+                         "--batch-size must equal --loss-group-size")
     random.seed(a.seed)
     np.random.seed(a.seed)
     torch.manual_seed(a.seed)
@@ -489,6 +512,7 @@ def main():
         "micro_batch": a.batch_size,
         "gradient_accumulation": a.grad_accum,
         "effective_batch": a.batch_size * a.grad_accum,
+        "loss_group_size": a.loss_group_size,
         "epochs": a.epochs,
         "num_tasks": a.num_tasks,
         "row_limit": a.limit,
@@ -506,7 +530,7 @@ def main():
             manifest = json.load(manifest_file)
         for key in (
             "method", "data_root", "seed", "model", "rank", "alpha", "dropout",
-            "data_sha256", "runtime_sha256", "micro_batch", "gradient_accumulation",
+            "data_sha256", "runtime_sha256", "micro_batch", "gradient_accumulation", "loss_group_size",
             "epochs", "num_tasks", "row_limit", "scheduler", "prompt_mode"
         ):
             if manifest.get(key) != requested_manifest.get(key):
