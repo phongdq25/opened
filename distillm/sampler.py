@@ -2,6 +2,8 @@ import torch
 import os
 from transformers import GenerationConfig
 
+from gen_config import generation_kwargs
+
 
 class SampleGenerator():
     def __init__(self, args, tokenizer):
@@ -39,6 +41,7 @@ class SampleGenerator():
                 **gen_data,
                 generation_config=self.generation_config,
                 max_new_tokens=self.max_new_token,
+                **generation_kwargs(self.args),
             )
             
             full_ids = gen_out.sequences

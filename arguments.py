@@ -235,7 +235,11 @@ def add_gen_args(parser: argparse.ArgumentParser):
     group.add_argument("--repetition-penalty", type=float, default=None)
     group.add_argument("--num-beams", type=int, default=1)
     group.add_argument("--temperature", type=float, default=1)
-    
+    group.add_argument("--strict-generation", action="store_true",
+                       help="use every GenerationConfig as written; by default transformers fills fields "
+                            "left at their library default from the model's generation_config.json (see "
+                            "gen_config.py), which is how all runs so far were made")
+
     return parser
 
 

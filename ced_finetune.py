@@ -54,6 +54,7 @@ from ced_losses import (
     sd_pack, sd_gather, sd_teacher_entropy, sd_parses, sd_prepare, sd_omission_mask,
     sd_loss_fn, compute_token_weights, prepare_span_indices_and_weights, get_span_loss,
     compute_overall_span_loss, CKA_MIN_SPANS, cka_span_loss, compute_hidden_span_loss)
+from gen_config import generation_kwargs
 
 torch.set_num_threads(4)
 
@@ -244,7 +245,8 @@ def sd_probe(args, tokenizer, model, ema, dataset, device):
         batch = sd_left_pad([s.to(device) for s in prompt_seqs], SD_EOS_IDS[0], device)
         with torch.no_grad(), sd_ema_weights(model, ema):
             seqs = model.generate(**batch, generation_config=gen_config,
-                                  max_new_tokens=args.max_length - args.max_prompt_length).sequences
+                                  max_new_tokens=args.max_length - args.max_prompt_length,
+                                  **generation_kwargs(args)).sequences
         return tokenizer.batch_decode(seqs[:, batch["input_ids"].size(1):], skip_special_tokens=True)
 
     s_prompts = [gen_data["input_ids"][i][gen_data["attention_mask"][i].bool()] for i in range(n)]
@@ -799,7 +801,8 @@ def evaluate(args, tokenizer, model, dataset: LMTrainDataset, split, epoch, devi
                 gen_out = model.generate(
                     **gen_data,
                     generation_config=generation_config,
-                    max_new_tokens=max_new_tokens)
+                    max_new_tokens=max_new_tokens,
+                    **generation_kwargs(args))
                 
                 full_ids = gen_out.sequences
                 

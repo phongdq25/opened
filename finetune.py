@@ -45,6 +45,7 @@ from rouge_metric import compute_metrics
 
 from peft import PeftModel
 from ed_eval import ed_evaluate
+from gen_config import generation_kwargs
 
 torch.set_num_threads(4)
 
@@ -491,7 +492,8 @@ def evaluate(args, tokenizer, model, dataset: LMTrainDataset, split, epoch, devi
                 gen_out = model.generate(
                     **gen_data,
                     generation_config=generation_config,
-                    max_new_tokens=max_new_tokens)
+                    max_new_tokens=max_new_tokens,
+                    **generation_kwargs(args))
                 
                 full_ids = gen_out.sequences
                 

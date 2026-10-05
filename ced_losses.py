@@ -12,6 +12,7 @@ import torch.nn.functional as F
 from transformers import GenerationConfig
 
 import ced_omask
+from gen_config import generation_kwargs
 from distillm import forward_kl, reverse_kl, js_distance, tv_distance
 from distillm import skewed_forward_kl, skewed_reverse_kl, csd, amid
 
@@ -212,7 +213,7 @@ def sd_prepare(args, tokenizer, model, ema, gen_data, no_model_batch, device):
     model.eval()
     with torch.no_grad():
         seqs = model.generate(**gen_data, generation_config=gen_config,
-                              max_new_tokens=args.max_length - P).sequences
+                              max_new_tokens=args.max_length - P, **generation_kwargs(args)).sequences
 
     # real prompt tokens come from the attention mask: pad == eos == <|im_end|>,
     # which also appears inside the chat prompt, so filtering by pad id is wrong
