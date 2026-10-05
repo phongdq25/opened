@@ -218,9 +218,14 @@ Same experiments, same objectives, much less wall-clock. What changed and how to
     RKL 32.3 GiB, IncLoRA 23.7 GiB. The wall-clock of that run (5,071 s and 4,912 s) is not
     comparable with the round-1 table: the card also ran three FewRel jobs and the checks
     above at 100% utilization.
-- **Compiled sampling.** `COMPILE_GEN=1` (`--compile-generation`) samples inside training
-  steps (self-distillation in Ours, DistiLLM/AMiD student generation) with a static KV cache,
-  which transformers compiles. The settings and the random stream are unchanged.
+- **Compiled sampling (opt-in).** `COMPILE_GEN=1` (`--compile-generation`) samples Ours'
+  self-distillation responses with a static KV cache, which transformers compiles. Measured on a
+  shared H200 (ACE task 1, physical batch 8): 27.6-35.5 s → 22.8-23.8 s per update.
+  - The samples are not bit-identical to eager sampling: compiled kernels flip near-tied tokens,
+    so a compiled run differs from an eager one like another random draw. It stays off by
+    default, so new Ours numbers stay comparable with eager runs.
+  - DistiLLM/AMiD student generation stays uncompiled. It samples a different number of rows
+    each step, every new batch size recompiles, and it measured slower.
 
 Measured on 1× H200 NVL (`bash tools/bench_gpu.sh h200`):
 

@@ -83,3 +83,18 @@ launch overhead of a 0.6B model.
   - CUDA graphs keep their own pools.
 - **DeepSpeed, PEFT or MPS interplay** the spike did not cover. The GPU checks run through the
   real runner, with DeepSpeed and PEFT.
+
+## Outcome (measured 2026-10-05/06, plan Task 3)
+
+- **Ours (ACE task 1, physical batch 8, shared card at 100% use):** 27.6-35.5 s per update eager
+  against 22.8-23.8 s compiled.
+  - The eager path is deterministic run to run.
+  - The compiled run's sampled responses diverge from it (first logged losses 2.7% and 1.5%
+    apart; test loss 0.887 against 0.889). They are equivalent in distribution, not bit-identical.
+- **DistiLLM with student generation on every update:** slower compiled (step 8.0 s against
+  4.8 s, wall 287 s against 198 s). Its generation batch size changes from step to step, and
+  each new size recompiles.
+- **Decision:** compiled sampling applies to self-distillation only (DistiLLM/AMiD keep
+  `generation_kwargs`), and `COMPILE_GEN` stays 0 by default on every card. It is an opt-in for
+  Ours runs where speed matters more than comparability with eager runs.
+

@@ -50,7 +50,10 @@ def test_self_distillation_samples_with_a_static_cache_when_compiling(tokenizer,
 
 
 @pytest.mark.parametrize("compiled", [False, True])
-def test_student_generation_samples_with_a_static_cache_when_compiling(compiled):
+def test_student_generation_stays_uncompiled(compiled):
+    """DistiLLM/AMiD generate for a varying number of rows per step, and every new batch size
+    recompiles: measured slower (plan 2026-10-06-compiled-sd-generation, Task 3), so it keeps
+    generation_kwargs whatever --compile-generation says."""
     from distillm.sampler import SampleGenerator
     args = ced_args(compile_generation=compiled, max_length=20, max_prompt_length=10)
     sampler = SampleGenerator(args, Namespace(pad_token_id=0, eos_token_id=1))
@@ -58,7 +61,7 @@ def test_student_generation_samples_with_a_static_cache_when_compiling(compiled)
     gen_data = {"input_ids": torch.full((1, 10), 7), "attention_mask": torch.ones(1, 10, dtype=torch.long)}
     with pytest.raises(Stop):
         sampler.run_sample(RecordingModel(seen), gen_data)
-    assert seen.get("cache_implementation") == ("static" if compiled else None)
+    assert "cache_implementation" not in seen
 
 
 def test_evaluation_keeps_its_own_generation_kwargs():
