@@ -17,7 +17,7 @@ PERM=${2:?perm required: 0..4}
 GPU=${3:?gpu id required}
 NTASK=${NTASK:-10}
 RANK=${RANK:-16}; ALPHA=${ALPHA:-64}; EPOCHS=${EPOCHS:-5}; LR=${LR:-2e-4}; SEED=${SEED:-42}
-BS=${BS:-2}; ACC=${ACC:-16}; EBS=${EBS:-16}
+BS=${BS:-2}; ACC=${ACC:-16}; EBS=${EBS:-128}
 NEED_LORA_MB=${NEED_LORA_MB:-14000}
 NEED_MIGU_MB=${NEED_MIGU_MB:-28000}
 NEED_DISK_GB=${NEED_DISK_GB:-10}
@@ -25,6 +25,7 @@ PROTOCOL=${PROTOCOL:-cre}
 METHODS=${METHODS:-"tree inclora olora inflora epi migu gainlora_o gainlora_inf"}
 
 cd "$(dirname "$0")/../../.."
+source scripts/qwen/lib.sh
 PY=${PY:-$HOME/miniconda3/envs/mta/bin/python}
 export PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}
 # peft needs to reach the hub to validate the base model; offline mode raises instead of
@@ -60,11 +61,11 @@ for M in ${METHODS}; do
     RUN_ID=cllora_${M}_perm${PERM}_${DS}_${PROTOCOL}_s${SEED}
     RUN=results/qwen3/ced/${RUN_ID}
     if [ -f "${RUN}/.complete" ]; then log "SKIP ${M} (xong)"; continue; fi
-    # another lane on the same card may already be on this method
-    if ps aux | grep "cl-method ${M} " | grep -v grep > /dev/null; then
-        log "${M} dang chay o lane khac, cho..."
-        while ps aux | grep "cl-method ${M} " | grep -v grep > /dev/null; do sleep 300; done
-        [ -f "${RUN}/.complete" ] && { log "SKIP ${M} (lane khac lam xong)"; continue; }
+    # another lane may already be training this exact run (same method and order)
+    if run_active "${M}" "data/${DS}_perm${PERM}"; then
+        log "${M} perm${PERM} is running in another lane, waiting..."
+        while run_active "${M}" "data/${DS}_perm${PERM}"; do sleep 300; done
+        [ -f "${RUN}/.complete" ] && { log "SKIP ${M} (finished by the other lane)"; continue; }
     fi
     if [ "${M}" = "migu" ]; then NEED=${NEED_MIGU_MB}; else NEED=${NEED_LORA_MB}; fi
     wait_disk; wait_mem ${NEED}

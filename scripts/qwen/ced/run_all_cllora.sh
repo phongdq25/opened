@@ -20,7 +20,7 @@ for M in "$@"; do
     bash scripts/qwen/ced/run_cllora.sh \
         --method "${M}" --data-root "${DATA_ROOT}" --num-tasks "${NUM_TASKS}" \
         --rank "${RANK:-16}" --alpha 64 --lr 2e-4 --epochs "${EPOCHS}" \
-        --batch-size 32 --grad-accum 1 --eval-batch-size 16 \
+        --batch-size 32 --grad-accum 1 --eval-batch-size "${EVAL_BS:-128}" \
         --gpu "${GPU}" --py "${PY}" --protocol "${PROTOCOL:-v2}" \
         "${RESUME_ARGS[@]}"
 done

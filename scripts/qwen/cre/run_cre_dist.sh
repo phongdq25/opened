@@ -31,6 +31,9 @@ NEED_DISK_GB=${NEED_DISK_GB:-10}
 PORT_PREFIX=${PORT_PREFIX:-66}
 METHODS=${METHODS:-"rkl csd sfkl fkl srkl amid distillm"}
 TAG=${TAG:-cre}
+T0_ONLY=${T0_ONLY:-0}   # 1 = make sure the shared task0 exists, then exit (per-method scheduling)
+KEEP_T0=${KEEP_T0:-0}   # 1 = keep task0/merged at the end: other jobs of this order still need it
+NEED_T0=${NEED_T0:-0}   # 1 = never (re)create task0 here; fail if it is missing
 
 cd "$(dirname "$0")/../../.."
 ENV_BIN=${ENV_BIN:-$HOME/miniconda3/envs/mta/bin}
@@ -92,6 +95,7 @@ log "CRE-DIST START ds=${DS} perm=${PERM} gpu=${GPU} tasks=${NTASK} methods='${M
 
 # ---- shared task0 (plain CE) ----
 if [ ! -d results/qwen3/ced/${T0RUN}/task0/merged ]; then
+    [ "${NEED_T0}" = "1" ] && { log "missing shared task0 ${T0RUN} (NEED_T0=1)"; exit 1; }
     # merged/ is deleted by the cleanup at the bottom of this script after every successful
     # sweep (disk space), so a re-run always lands here even when the rest of ${T0RUN} (log.txt,
     # run_manifest.json) is still on disk from that earlier sweep. run_ced_v2.sh refuses to
@@ -109,6 +113,7 @@ if [ ! -d results/qwen3/ced/${T0RUN}/task0/merged ]; then
 fi
 T0=$PWD/results/qwen3/ced/${T0RUN}/task0/merged
 [ -d "${T0}" ] || { log "khong co teacher task0"; exit 1; }
+[ "${T0_ONLY}" = "1" ] && { log "T0 READY ${T0RUN}"; exit 0; }
 
 # ---- the seven methods, tasks 1..LAST from that shared task0 ----
 for M in ${METHODS}; do
@@ -136,5 +141,5 @@ for M in ${METHODS}; do
     fi
     rm -rf results/qwen3/ced/${RUN}/task*/merged
 done
-rm -rf results/qwen3/ced/${T0RUN}/task0/merged
+[ "${KEEP_T0}" = "1" ] || rm -rf results/qwen3/ced/${T0RUN}/task0/merged
 log "CRE-DIST ALL DONE ds=${DS} perm=${PERM}"

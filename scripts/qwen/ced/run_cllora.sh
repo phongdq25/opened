@@ -13,7 +13,7 @@ cd "$(dirname "$0")/../../.."
 MODEL_PATH=${MODEL_PATH:-Qwen/Qwen3-0.6B}
 
 METHOD=""; DATA_ROOT="data_ced/ace_b10_perm0"; NUM_TASKS=5; RANK=16; ALPHA=64
-LR=0.0002; EPOCHS=5; BS=2; GA=16; EBS=16; REG=0.5; MIGU=0.7; SEED=42; GPU=0
+LR=0.0002; EPOCHS=5; BS=2; GA=16; EBS=128; REG=0.5; MIGU=0.7; SEED=42; GPU=0
 PROTOCOL="v2"; SAVE=""
 RESUME=0
 END_TASK=""
@@ -45,6 +45,9 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 [ -z "${METHOD}" ] && { echo "--method required"; exit 1; }
+source scripts/qwen/lib.sh
+read -r PBS PGA <<< "$(phys_split "${BS}" "${GA}" "${PHYS_BS:-${BS}}")"
+[ "${METHOD}" = "migu" ] && { PBS=${BS}; PGA=${GA}; }   # MIGU's gradient mask comes from each step's activations
 [ -x "${PY}" ] || { echo "python not executable: ${PY}"; exit 1; }
 [ -s "${DATA_ROOT}/streams.json" ] || { echo "missing ${DATA_ROOT}/streams.json"; exit 1; }
 for TASK in $(seq 0 $((NUM_TASKS - 1))); do
@@ -99,7 +102,7 @@ fi
 ${PY} cl_lora/engine.py \
     --cl-method "${METHOD}" --data-root "${DATA_ROOT}" --num-tasks "${NUM_TASKS}" \
     --rank "${RANK}" --alpha "${ALPHA}" --lr "${LR}" --epochs "${EPOCHS}" \
-    --batch-size "${BS}" --grad-accum "${GA}" --eval-batch-size "${EBS}" \
+    --batch-size "${PBS}" --grad-accum "${PGA}" --loss-group-size "${BS}" --eval-batch-size "${EBS}" \
     --cl-reg "${REG}" --cl-migu-ratio "${MIGU}" --seed "${SEED}" \
     --limit "${LIMIT}" --model-path "${MODEL_PATH}" \
     --save "${SAVE}" "${RESUME_ARG[@]}" "${END_TASK_ARG[@]}" \
