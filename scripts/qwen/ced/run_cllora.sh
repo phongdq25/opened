@@ -49,6 +49,7 @@ source scripts/qwen/lib.sh
 read -r PBS PGA <<< "$(phys_split "${BS}" "${GA}" "${PHYS_BS:-${BS}}")"
 [ "${METHOD}" = "migu" ] && { PBS=${BS}; PGA=${GA}; }   # MIGU's gradient mask comes from each step's activations
 [ -x "${PY}" ] || { echo "python not executable: ${PY}"; exit 1; }
+vllm_check "${PY}" || exit 1   # GEN_BACKEND=vllm without vLLM: stop before the run directory exists
 [ -s "${DATA_ROOT}/streams.json" ] || { echo "missing ${DATA_ROOT}/streams.json"; exit 1; }
 for TASK in $(seq 0 $((NUM_TASKS - 1))); do
     for SPLIT in train dev test; do
@@ -105,6 +106,7 @@ ${PY} cl_lora/engine.py \
     --batch-size "${PBS}" --grad-accum "${PGA}" --loss-group-size "${BS}" --eval-batch-size "${EBS}" \
     --cl-reg "${REG}" --cl-migu-ratio "${MIGU}" --seed "${SEED}" \
     --limit "${LIMIT}" --model-path "${MODEL_PATH}" \
+    --gen-backend "${GEN_BACKEND:-hf}" \
     --save "${SAVE}" "${RESUME_ARG[@]}" "${END_TASK_ARG[@]}" \
     >> "${LOG}" 2>&1
 "${PY}" -m json.tool "${SAVE}/cl_results.json" > "${LOG_PRE}_results.log"

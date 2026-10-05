@@ -43,6 +43,7 @@ PHYS_BS=${PHYS_BS:-}                    # physical batch target, empty = --bs (s
 EVAL_GEN_MODE=${EVAL_GEN_MODE:-final}   # final: test answers after each task's last update only
 DYNAMIC_PAD=${DYNAMIC_PAD:-1}           # the trainer keeps fixed padding with a span loss or DistiLLM
 STRICT_GEN=${STRICT_GEN:-0}             # 1 = generation configs used as written (gen_config.py): changes results
+GEN_BACKEND=${GEN_BACKEND:-hf}         # vllm = answers and pseudo-labels from vLLM (gen_backend.py), same settings
 RESUME=0
 
 while [[ $# -gt 0 ]]; do
@@ -102,6 +103,7 @@ while [[ $# -gt 0 ]]; do
         --eval-gen-mode) EVAL_GEN_MODE=$2; shift 2;;
         --dynamic-pad) DYNAMIC_PAD=$2; shift 2;;
         --strict-gen) STRICT_GEN=$2; shift 2;;
+        --gen-backend) GEN_BACKEND=$2; shift 2;;
         --resume) RESUME=1; shift;;
         *) echo "unknown flag $1"; exit 1;;
     esac
@@ -119,6 +121,7 @@ if [ -x "${ENV_BIN}/nvcc" ]; then
     export CUDA_HOME=$(dirname "${ENV_BIN}")
 fi
 export PATH=${ENV_BIN}:$PATH
+vllm_check "${ENV_BIN}/python" || exit 1   # GEN_BACKEND=vllm without vLLM: stop before the run directory exists
 
 BASE_PATH=.
 # local copy from download.txt when present (see run.sh), else the hub name
@@ -150,7 +153,7 @@ fi
 mkdir -p ${RUN_ROOT}
 MANIFEST="${RUN_ROOT}/run_manifest.json"
 MANIFEST_METHOD=${KD_TYPE}; [ "${MODE}" = "sft" ] && MANIFEST_METHOD=sft
-MANIFEST_CONFIG="mode=${MODE};kd_ratio=${KD_RATIO};w_span=${W_SPAN};kd_type=${KD_TYPE};skew=${SKEW};span_metric=${SPAN_METRIC};layers=${LAYERS};pl=${PL};pl_dedup=${PL_DEDUP};pl_conf=${PL_CONF}/${PL_CONF_PCT}/${PL_CONF_THRESH};pl_lexicon=${PL_LEXICON};boost=${BOOST};kd_scope=${KD_SCOPE};balance=${BAL}/${BAL_PT}/${BAL_LR}/${BAL_DIST};select_best=${SELECT_BEST};kd_new=${KDNEW};sd=${SD}/${W_SD}/${SD_MU}/${SD_TEMP}/${SD_DIV}/top_p=${SD_TOP_P}/skip_unparsed=${SD_SKIP_UNPARSED}/warmup=${SD_WARMUP}/omask=${SD_OMASK};lr=${LR}/${LR_LATER};train_num=${TRAIN_NUM};dev_num=${DEV_NUM};smoke_rows=${SMOKE_ROWS};eval_bs=${EVAL_BS};phys=${PBS}x${PACC};eval_gen=${EVAL_GEN_MODE};dyn_pad=${DYNAMIC_PAD};strict_gen=${STRICT_GEN};extra=${EXTRA_ARGS}"
+MANIFEST_CONFIG="mode=${MODE};kd_ratio=${KD_RATIO};w_span=${W_SPAN};kd_type=${KD_TYPE};skew=${SKEW};span_metric=${SPAN_METRIC};layers=${LAYERS};pl=${PL};pl_dedup=${PL_DEDUP};pl_conf=${PL_CONF}/${PL_CONF_PCT}/${PL_CONF_THRESH};pl_lexicon=${PL_LEXICON};boost=${BOOST};kd_scope=${KD_SCOPE};balance=${BAL}/${BAL_PT}/${BAL_LR}/${BAL_DIST};select_best=${SELECT_BEST};kd_new=${KDNEW};sd=${SD}/${W_SD}/${SD_MU}/${SD_TEMP}/${SD_DIV}/top_p=${SD_TOP_P}/skip_unparsed=${SD_SKIP_UNPARSED}/warmup=${SD_WARMUP}/omask=${SD_OMASK};lr=${LR}/${LR_LATER};train_num=${TRAIN_NUM};dev_num=${DEV_NUM};smoke_rows=${SMOKE_ROWS};eval_bs=${EVAL_BS};phys=${PBS}x${PACC};eval_gen=${EVAL_GEN_MODE};dyn_pad=${DYNAMIC_PAD};strict_gen=${STRICT_GEN};gen=${GEN_BACKEND};extra=${EXTRA_ARGS}"
 MANIFEST_ARGS=(
     init --output "${MANIFEST}" --run "${RUN_NAME}" --method "${MANIFEST_METHOD}"
     --permutation "${PERM}" --seed "${SEED}" --data-root "${BASE_PATH}/data/${DATA_PREFIX}${PERM}"
@@ -188,7 +191,7 @@ if [ "${RESUME}" = "1" ]; then
         rm -rf "${RUN_ROOT}/task${STALE_TASK}"
     done
 fi
-echo "run=${RUN_NAME} mode=${MODE} perm=${PERM} data=${DATA_PREFIX} pl=${PL} boost=${BOOST} kd_scope=${KD_SCOPE} bal=${BAL}/${BAL_PT}/${BAL_LR} kd_ratio=${KD_RATIO} w_span=${W_SPAN} ${KD_TYPE}/${SKEW}/${SPAN_METRIC} layers='${LAYERS}' bs=${BS}x${ACC} lr=${LR}/${LR_LATER} ep=${EPOCHS} seed=${SEED} lora=${RANK}/${ALPHA} greedy=${GREEDY} sd=${SD}/${W_SD}/${SD_MU}/${SD_TEMP}/${SD_DIV}/top_p=${SD_TOP_P}/skip_unparsed=${SD_SKIP_UNPARSED}/warmup=${SD_WARMUP}/omask=${SD_OMASK} task0_source=${TASK0_SOURCE_RUN:-none} phys=${PBS}x${PACC} eval_gen=${EVAL_GEN_MODE} dyn_pad=${DYNAMIC_PAD} strict_gen=${STRICT_GEN}" \
+echo "run=${RUN_NAME} mode=${MODE} perm=${PERM} data=${DATA_PREFIX} pl=${PL} boost=${BOOST} kd_scope=${KD_SCOPE} bal=${BAL}/${BAL_PT}/${BAL_LR} kd_ratio=${KD_RATIO} w_span=${W_SPAN} ${KD_TYPE}/${SKEW}/${SPAN_METRIC} layers='${LAYERS}' bs=${BS}x${ACC} lr=${LR}/${LR_LATER} ep=${EPOCHS} seed=${SEED} lora=${RANK}/${ALPHA} greedy=${GREEDY} sd=${SD}/${W_SD}/${SD_MU}/${SD_TEMP}/${SD_DIV}/top_p=${SD_TOP_P}/skip_unparsed=${SD_SKIP_UNPARSED}/warmup=${SD_WARMUP}/omask=${SD_OMASK} task0_source=${TASK0_SOURCE_RUN:-none} phys=${PBS}x${PACC} eval_gen=${EVAL_GEN_MODE} dyn_pad=${DYNAMIC_PAD} strict_gen=${STRICT_GEN} gen=${GEN_BACKEND}" \
     | tee ${RUN_ROOT}/run_config.txt
 
 tokenize () {  # $1=raw dir  $2=processed dir  [$3=teacher prompt cap, default 640]
@@ -208,6 +211,7 @@ train_once () {  # $1=engine $2=init $3=data_dir $4=save $5=lr $6=epochs $7=extr
     OPTS+=" --loss-group-size ${BS} --eval-gen-mode ${EVAL_GEN_MODE} --eval-loss-batch-size 32"
     [ "${DYNAMIC_PAD}" = "1" ] && OPTS+=" --dynamic-pad"
     [ "${STRICT_GEN}" = "1" ] && OPTS+=" --strict-generation"
+    OPTS+=" --gen-backend ${GEN_BACKEND}"
     OPTS+=" --warmup-iters 0 --warmup-ratio 0.1 --lr-decay-style wrmup_cosine --weight-decay 1e-2 --clip-grad 1.0"
     OPTS+=" --epochs $6 --max-length 768 --max-prompt-length 460"
     OPTS+=" --do-train --do-valid --eval-gen --save-interval -1 --eval-interval -1 --log-interval 20 --mid-log-num -1"
@@ -264,6 +268,7 @@ do
             PL_BS=64; [ "${PL_CONF}" != "none" ] && PL_BS=32
             PL_OPTS="--conflict-dedup ${PL_DEDUP} --conf-filter ${PL_CONF} --conf-percentile ${PL_CONF_PCT}"
             PL_OPTS+=" --lexicon-filter ${PL_LEXICON}"
+            PL_OPTS+=" --gen-backend ${GEN_BACKEND}"
             [ -n "${PL_CONF_THRESH}" ] && PL_OPTS+=" --conf-thresh ${PL_CONF_THRESH}"
             ${ENV_BIN}/python ${BASE_PATH}/tools/ced_pseudo_label.py \
                 --teacher ${INIT_MODEL} --data-dir ${STAGE} \

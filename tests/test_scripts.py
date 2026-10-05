@@ -1,5 +1,6 @@
 import os
 import subprocess
+import sys
 import time
 
 import pytest
@@ -74,27 +75,28 @@ def fake_smi(mib):
 
 
 @pytest.mark.parametrize("mib,expected", [
-    ("143771", "3 8 1 39833 18432"),       # H200 NVL: the values tools/bench_gpu.sh measured
-    ("46068", "1 - 0 - -"),                # 46 GB cards: one run per GPU, the runners' own settings
-    ("0", "1 - 0 - -"),                    # no nvidia-smi
+    ("143771", "3 8 1 39833 18432 hf"),    # H200 NVL: the values tools/bench_gpu.sh measured
+    ("46068", "1 - 0 - - hf"),             # 46 GB cards: one run per GPU, the runners' own settings
+    ("0", "1 - 0 - - hf"),                 # no nvidia-smi
 ])
 def test_gpu_defaults_give_the_h200_measurements_only_to_h200_class_cards(mib, expected):
     assert bash(f"gpu_defaults {mib}").stdout.strip() == expected
 
 
 @pytest.mark.parametrize("mib,preset,expected", [
-    ("143771", "", "slots=3 phys=8 mps=1 gpu=39833 lora=18432"),
-    ("46068", "", "slots=1 phys=unset mps=0 gpu=unset lora=unset"),
-    ("143771", "PHYS_BS=16 SLOTS_PER_GPU=2 USE_MPS=0", "slots=2 phys=16 mps=0 gpu=39833 lora=18432"),
+    ("143771", "", "slots=3 phys=8 mps=1 gpu=39833 lora=18432 gen=hf"),
+    ("46068", "", "slots=1 phys=unset mps=0 gpu=unset lora=unset gen=hf"),
+    ("143771", "PHYS_BS=16 SLOTS_PER_GPU=2 USE_MPS=0 GEN_BACKEND=vllm", "slots=2 phys=16 mps=0 gpu=39833 lora=18432 gen=vllm"),
 ])
 def test_apply_card_defaults_fills_only_what_the_caller_left_unset(tmp_path, mib, preset, expected):
     bin_dir = fake_bin(tmp_path, **{"nvidia-smi": fake_smi(mib)})
     preset = f"export {preset};" if preset else ""          # what the caller's environment already holds
     out = subprocess.run(["bash", "-c", f'source {os.path.abspath(LIB)}; {preset} apply_card_defaults 0 1; '
                           'echo "slots=$SLOTS_PER_GPU phys=${PHYS_BS:-unset} mps=$USE_MPS '
-                          'gpu=${NEED_GPU_MB:-unset} lora=${NEED_LORA_MB:-unset}"'],
+                          'gpu=${NEED_GPU_MB:-unset} lora=${NEED_LORA_MB:-unset} gen=${GEN_BACKEND:-unset}"'],
                          env={k: v for k, v in {**os.environ, "PATH": f"{bin_dir}:{os.environ['PATH']}"}.items()
-                              if k not in ("PHYS_BS", "SLOTS_PER_GPU", "USE_MPS", "NEED_GPU_MB", "NEED_LORA_MB")},
+                              if k not in ("PHYS_BS", "SLOTS_PER_GPU", "USE_MPS", "NEED_GPU_MB", "NEED_LORA_MB",
+                                           "GEN_BACKEND")},
                          capture_output=True, text=True)
     assert out.stdout.strip() == expected, out.stderr
 
@@ -120,3 +122,49 @@ def test_mps_start_keeps_the_daemon_only_when_a_cuda_client_can_use_it(tmp_path,
 
 def test_run_sh_takes_its_defaults_from_the_cards():
     assert "apply_card_defaults" in open("run.sh").read()
+
+
+def vllm_python(tmp_path):
+    """A VLLM_PY that tells gen_backend.find_vllm_python() it holds vLLM 0.27.1."""
+    python = tmp_path / "vllm_python"
+    python.write_text('#!/bin/bash\nif [ "$1" = "-c" ]; then echo "VLLM_VERSION 0.27.1"; exit 0; fi\n')
+    python.chmod(0o755)
+    return str(python)
+
+
+@pytest.mark.parametrize("backend,found,rc", [("hf", False, 0), ("vllm", False, 1), ("vllm", True, 0)])
+def test_vllm_check_stops_only_a_vllm_run_without_vllm(tmp_path, backend, found, rc):
+    vllm_py = vllm_python(tmp_path) if found else str(tmp_path / "missing")
+    out = subprocess.run(["bash", "-c", f"source {LIB}; vllm_check {sys.executable}"],
+                         env={**os.environ, "GEN_BACKEND": backend, "VLLM_PY": vllm_py},
+                         capture_output=True, text=True)
+    assert out.returncode == rc, out.stderr
+    if rc:
+        assert "no vLLM environment" in out.stderr
+
+
+@pytest.mark.parametrize("runner,args", [
+    ("scripts/qwen/ced/run_cllora.sh", ["--method", "inclora", "--data-root", "data/tacred_perm0", "--num-tasks", "10"]),
+    ("scripts/qwen/ced/run_ced_v2.sh", ["--run-name", "vllm_refusal_probe", "--gpus", "0"]),
+])
+def test_runners_refuse_vllm_without_an_environment_before_any_run_directory(runner, args, tmp_path):
+    save = tmp_path / "run"
+    extra = ["--py", sys.executable, "--save", str(save)] if "cllora" in runner else []
+    env = {**os.environ, "GEN_BACKEND": "vllm", "VLLM_PY": str(tmp_path / "missing"),
+           "ENV_BIN": os.path.dirname(sys.executable)}
+    out = subprocess.run(["bash", runner] + args + extra, env=env, capture_output=True, text=True, timeout=600)
+    assert out.returncode != 0
+    assert "no vLLM environment" in out.stdout + out.stderr
+    assert not save.exists() and not os.path.exists("results/qwen3/ced/vllm_refusal_probe")
+
+
+def test_the_ced_runner_records_the_backend_in_its_manifest():
+    script = open("scripts/qwen/ced/run_ced_v2.sh").read()
+    manifest_line = next(line for line in script.splitlines() if line.startswith("MANIFEST_CONFIG="))
+    assert ";gen=${GEN_BACKEND};" in manifest_line
+
+
+def test_the_runners_hand_the_backend_on():
+    ced = open("scripts/qwen/ced/run_ced_v2.sh").read()
+    assert 'OPTS+=" --gen-backend ${GEN_BACKEND}"' in ced and 'PL_OPTS+=" --gen-backend ${GEN_BACKEND}"' in ced
+    assert '--gen-backend "${GEN_BACKEND:-hf}"' in open("scripts/qwen/ced/run_cllora.sh").read()

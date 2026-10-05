@@ -188,6 +188,17 @@ Same experiments, same objectives, much less wall-clock. What changed and how to
   This branch keeps that behaviour so new numbers match existing ones. `STRICT_GEN=1`
   (`--strict-generation`) makes every config literal: greedy evaluation and the requested
   temperatures. That changes results, so decide it for the whole table.
+- **Generation backend.** `GEN_BACKEND=vllm` generates the evaluation answers and the teacher's
+  pseudo-labels with vLLM (`gen_backend.py`, `tools/vllm_generate.py`).
+  - vLLM gets the settings transformers' `generate()` would use, including the fill-in above,
+    and the same prompt tokens.
+  - Text handling and scoring stay as they are.
+  - GainLoRA and EPI keep Hugging Face generation, because they pick adapters per input. The
+    CL-LoRA manifest records which backend each run used.
+  - vLLM runs in its own environment. `VLLM_PY` points at its Python; otherwise
+    `./.venv-vllm` or `/venv/main` is used. To create one:
+    `uv venv .venv-vllm --python 3.12 && uv pip install --python .venv-vllm vllm==0.27.1`.
+  - `VLLM_GPU_GB` (default 10) caps each vLLM instance. `VLLM_EAGER=1` turns off CUDA graphs.
 
 Measured on 1× H200 NVL (`bash tools/bench_gpu.sh h200`):
 

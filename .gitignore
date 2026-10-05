@@ -197,3 +197,4 @@ eval_outputs/
 /logs2
 /.mps
 /bench
+/.venv-vllm
