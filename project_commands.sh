@@ -17,7 +17,9 @@
 #   DRY=1 bash project_commands.sh                      # print the plan, train nothing
 #   ONLY="c" bash project_commands.sh                   # only some groups
 #
-# Defaults: venv .venv, GPUs 4-7 (POOL_GPUS below), one job per GPU, effective batch 2x16 = 32.
+# Defaults: venv .venv, every GPU nvidia-smi lists, effective batch 2x16 = 32. On H200-class
+# cards (>= 130 GB) 3 runs share each GPU at PHYS_BS=8 under CUDA MPS (measured, README);
+# smaller cards get one run per GPU with the runners' own settings.
 # Safe to re-run after a crash: a run with a .complete marker is skipped, and nothing is deleted.
 #
 # Effective batch stays 32 so every number is comparable with the f12_pl baseline. Per-device 32
@@ -29,9 +31,9 @@
 #   PY / ENV_BIN  interpreter and env bin/ for the runners (default: derived from `python`)
 #   SKIP_INSTALL  1 = never touch dependencies
 #   POOL_GPUS     GPU ids to use (default: every GPU nvidia-smi lists)
-#   SLOTS_PER_GPU runs sharing each GPU (default: set in section 3)
-#   PHYS_BS       physical micro-batch target for every runner (default: set in section 3)
-#   USE_MPS       1 = start CUDA MPS for runs sharing a GPU (default: set in section 3)
+#   SLOTS_PER_GPU runs sharing each GPU (default: by card size, scripts/qwen/lib.sh gpu_defaults)
+#   PHYS_BS       physical micro-batch target for every runner (default: by card size)
+#   USE_MPS       1 = start CUDA MPS for runs sharing a GPU (default: by card size)
 #   PERMS         default "0 1 2 3 4"
 #   DS            dataset, default fewrel: ace maven rams geneva (CED), tacred fewrel (CRE)
 #   DATA_PREFIX   default <ds>_b10_perm (CED) or <ds>_perm (CRE), the names under data/
@@ -40,6 +42,7 @@
 #                 (bash owns $GROUPS, hence ONLY)
 set -euo pipefail
 cd "$(dirname "$0")"
+source scripts/qwen/lib.sh
 
 step () { echo; echo "=== $* ==="; }
 have () { [ -e "$1" ]; }
@@ -372,20 +375,20 @@ done
 
 # Every GPU nvidia-smi lists, unless POOL_GPUS names some. SLOTS_PER_GPU runs share each card;
 # each slot is one run and gets its own torchrun port, 29500 + slot.
-POOL_GPUS=${POOL_GPUS:-$(nvidia-smi --query-gpu=index --format=csv,noheader 2>/dev/null | tr '\n' ' ')}
-SLOTS_PER_GPU=${SLOTS_PER_GPU:-3}
-export PHYS_BS=${PHYS_BS:-8}        # measured on 1x H200 NVL (tools/bench_gpu.sh)
-export USE_MPS=${USE_MPS:-1}
-export NEED_GPU_MB=${NEED_GPU_MB:-39833} NEED_LORA_MB=${NEED_LORA_MB:-18432}
+POOL_GPUS=${POOL_GPUS:-$( (nvidia-smi --query-gpu=index --format=csv,noheader 2>/dev/null || true) | tr '\n' ' ')}
+# SLOTS_PER_GPU, PHYS_BS, USE_MPS and the memory guards by card size: the values measured on
+# 1x H200 NVL on H200-class cards, one run per GPU with the runners' own settings on smaller
+# ones (scripts/qwen/lib.sh gpu_defaults). Anything set in the environment wins.
+apply_card_defaults ${POOL_GPUS}
 # The ids are nvidia-smi's (PCI order), and the runners both check memory with `nvidia-smi -i`
 # and train with CUDA_VISIBLE_DEVICES. CUDA's own default order is fastest-first, so make it
 # PCI order too, or on a mixed-GPU host the guard and the training would look at different cards.
 export CUDA_DEVICE_ORDER=PCI_BUS_ID
 GPUS=()
-for g in ${POOL_GPUS:-0}; do
-    for _ in $(seq 1 "${SLOTS_PER_GPU}"); do GPUS+=("${g}"); done
+for _ in $(seq 1 "${SLOTS_PER_GPU}"); do
+    for g in ${POOL_GPUS:-0}; do GPUS+=("${g}"); done   # round-robin: the first jobs spread over the cards
 done
-step "3. train ${#JOBS[@]} jobs on gpus ${GPUS[*]}"
+step "3. train ${#JOBS[@]} jobs on gpus ${GPUS[*]} (PHYS_BS=${PHYS_BS:-runner default} USE_MPS=${USE_MPS})"
 mkdir -p logs
 POOL_LOG=logs/${DS}_matrix_pool.log
 echo "progress: ${POOL_LOG}   per-run logs: logs_ours_*.log and ${R}/<run>/task*/train.log"
@@ -477,10 +480,9 @@ fi
 
 # Optional CUDA MPS: lets the runs sharing a card run their kernels concurrently.
 MPS_STARTED=0
-if [ "${USE_MPS:-0}" = "1" ] && [ "${DRY}" != "1" ] && command -v nvidia-cuda-mps-control > /dev/null; then
-    export CUDA_MPS_PIPE_DIRECTORY=${PWD}/.mps/pipe CUDA_MPS_LOG_DIRECTORY=${PWD}/.mps/log
-    mkdir -p "${CUDA_MPS_PIPE_DIRECTORY}" "${CUDA_MPS_LOG_DIRECTORY}"
-    nvidia-cuda-mps-control -d && MPS_STARTED=1 && log "CUDA MPS started"
+if [ "${USE_MPS:-0}" = "1" ] && [ "${DRY}" != "1" ]; then
+    if mps_start "${PY}" "${GPUS[0]}"; then MPS_STARTED=1; log "CUDA MPS started"
+    else log "CUDA MPS is not usable on this host, running without it"; fi
 fi
 PENDING=("${JOBS[@]}")
 declare -a SLOT_PID SLOT_JOB

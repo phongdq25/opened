@@ -55,3 +55,68 @@ def test_resuming_a_run_started_with_another_config_is_refused(tmp_path):
 @pytest.mark.parametrize("script", SCRIPTS)
 def test_scripts_parse(script):
     assert subprocess.run(["bash", "-n", script]).returncode == 0
+
+
+def fake_bin(tmp_path, **scripts):
+    """Executables named after the keyword arguments, put first on PATH by the callers."""
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir(exist_ok=True)
+    for name, body in scripts.items():
+        path = bin_dir / name
+        path.write_text("#!/bin/bash\n" + body + "\n")
+        path.chmod(0o755)
+    return bin_dir
+
+
+def fake_smi(mib):
+    """nvidia-smi on a host with two cards of `mib` MiB each."""
+    return f'case "$*" in *memory.total*) printf "{mib}\\n{mib}\\n" ;; *index*) printf "0\\n1\\n" ;; esac'
+
+
+@pytest.mark.parametrize("mib,expected", [
+    ("143771", "3 8 1 39833 18432"),       # H200 NVL: the values tools/bench_gpu.sh measured
+    ("46068", "1 - 0 - -"),                # 46 GB cards: one run per GPU, the runners' own settings
+    ("0", "1 - 0 - -"),                    # no nvidia-smi
+])
+def test_gpu_defaults_give_the_h200_measurements_only_to_h200_class_cards(mib, expected):
+    assert bash(f"gpu_defaults {mib}").stdout.strip() == expected
+
+
+@pytest.mark.parametrize("mib,preset,expected", [
+    ("143771", "", "slots=3 phys=8 mps=1 gpu=39833 lora=18432"),
+    ("46068", "", "slots=1 phys=unset mps=0 gpu=unset lora=unset"),
+    ("143771", "PHYS_BS=16 SLOTS_PER_GPU=2 USE_MPS=0", "slots=2 phys=16 mps=0 gpu=39833 lora=18432"),
+])
+def test_apply_card_defaults_fills_only_what_the_caller_left_unset(tmp_path, mib, preset, expected):
+    bin_dir = fake_bin(tmp_path, **{"nvidia-smi": fake_smi(mib)})
+    preset = f"export {preset};" if preset else ""          # what the caller's environment already holds
+    out = subprocess.run(["bash", "-c", f'source {os.path.abspath(LIB)}; {preset} apply_card_defaults 0 1; '
+                          'echo "slots=$SLOTS_PER_GPU phys=${PHYS_BS:-unset} mps=$USE_MPS '
+                          'gpu=${NEED_GPU_MB:-unset} lora=${NEED_LORA_MB:-unset}"'],
+                         env={k: v for k, v in {**os.environ, "PATH": f"{bin_dir}:{os.environ['PATH']}"}.items()
+                              if k not in ("PHYS_BS", "SLOTS_PER_GPU", "USE_MPS", "NEED_GPU_MB", "NEED_LORA_MB")},
+                         capture_output=True, text=True)
+    assert out.stdout.strip() == expected, out.stderr
+
+
+MPS_CONTROL = 'if [ $# -eq 0 ]; then echo "stdin:$(cat)" >> "${MPS_LOG}"; else echo "args:$*" >> "${MPS_LOG}"; fi'
+
+
+@pytest.mark.parametrize("client_rc", [0, 1])
+def test_mps_start_keeps_the_daemon_only_when_a_cuda_client_can_use_it(tmp_path, client_rc):
+    bin_dir = fake_bin(tmp_path, **{"nvidia-cuda-mps-control": MPS_CONTROL, "fakepy": f"exit {client_rc}"})
+    log = tmp_path / "mps.log"
+    out = subprocess.run(["bash", "-c", f'source {os.path.abspath(LIB)}; cd {tmp_path}; mps_start {bin_dir}/fakepy 0; '
+                          'echo "rc=$? pipe=${CUDA_MPS_PIPE_DIRECTORY:-unset}"'],
+                         env={**os.environ, "PATH": f"{bin_dir}:{os.environ['PATH']}", "MPS_LOG": str(log)},
+                         capture_output=True, text=True)
+    calls = log.read_text()
+    assert "args:-d" in calls
+    if client_rc == 0:
+        assert out.stdout.strip() == f"rc=0 pipe={tmp_path}/.mps/pipe" and "quit" not in calls
+    else:
+        assert out.stdout.strip() == "rc=1 pipe=unset" and "stdin:quit" in calls
+
+
+def test_run_sh_takes_its_defaults_from_the_cards():
+    assert "apply_card_defaults" in open("run.sh").read()

@@ -5,10 +5,10 @@
 # Tokenizes each requested permutation, then launches the distillation queue (7 methods)
 # and the CL-LoRA queue (8 methods) each on its own GPU set, in the background.
 #
-# Rule enforced by the per-family runners: at most ONE queue per GPU. This script respects
-# that by giving the distillation queue and the CL-LoRA queue separate GPUs and running each
-# one's permutations sequentially inside a single background process, so a GPU never has two
-# queues racing for its memory between tasks.
+# By default one queue per GPU: this script gives the distillation queue and the CL-LoRA queue
+# separate GPUs and runs each one's permutations sequentially inside a single background
+# process, so a GPU never has two queues racing for its memory between tasks. A card with room
+# for more (H200) can take several queues by repeating its id in a GPU list (see below).
 #
 # Each family gets a comma-separated GPU list (GPU_DIST_ALL / GPU_CLLORA_ALL below). With
 # more than one GPU the methods are split round-robin, one single-GPU sub-queue per GPU, so
@@ -32,7 +32,7 @@
 # marker per method+perm), so a dataset whose range is listed in full only trains the gaps,
 # and the plan stays correct as runs land. Datasets run ONE AT A TIME (dist+CL-LoRA
 # concurrently within a dataset, next dataset only after both queues of the current one
-# finish) so at most one queue ever sits on a given GPU. Override the whole thing with
+# finish), so two datasets' queues never share a GPU. Override the whole thing with
 # MISSING_PLAN="ds:perms:queue;..." or, for a plain list at all perms and both queues,
 # RUN_ALL_DATASETS="ds1 ds2 ...".
 #
@@ -78,7 +78,10 @@ cd "$(dirname "$0")"
 export CLLORA_METHODS="inclora olora tree inflora epi migu gainlora_o gainlora_inf"
 export DIST_METHODS="kd rkl sfkl srkl csd distillm amid"   # labels dist_queue.sh knows
 export RESUME=${RESUME:-0}   # both CED queues read this
-export PHYS_BS=${PHYS_BS:-8}   # physical micro-batch target on H200 (tools/bench_gpu.sh)
+# PHYS_BS and the runners' memory guards by card size: the values measured on 1x H200 NVL on
+# H200-class cards, the runners' own (PHYS_BS = --bs) on smaller ones (scripts/qwen/lib.sh)
+source scripts/qwen/lib.sh
+apply_card_defaults
 
 # What is still missing, dataset by dataset (checked 2026-09-26). One entry per dataset,
 # entries separated by ";", fields by ":" -> <dataset>:<perms>:<queue>.
