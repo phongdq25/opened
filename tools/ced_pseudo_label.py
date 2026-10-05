@@ -31,9 +31,15 @@ import json
 import os
 import re
 import shutil
+import sys
 
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
+
+# the runners start this file as `python tools/ced_pseudo_label.py`, so sys.path[0] is tools/
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from gen_backend import find_vllm_python, meta_model, resolve_generation_config, run_vllm, vllm_params  # noqa: E402
 
 
 def input_text_of(user_prompt):
@@ -99,6 +105,55 @@ def event_conf_score(text, trig, ty, gen_ids, token_logprobs, tokenizer):
     return float(valid[idx].mean())
 
 
+def chat_prompts(tokenizer, rows, idxs):
+    """The teacher's prompt text for each candidate row."""
+    return [tokenizer.apply_chat_template(
+        [{"role": "system", "content": rows[i]["system_prompt"]}, {"role": "user", "content": rows[i]["user_prompt"]}],
+        add_generation_prompt=True, tokenize=False, enable_thinking=False) for i in idxs]
+
+
+def strip_stop(ids, tokenizer):
+    """Generated ids without eos/pad: the view event_conf_score aligns with the text."""
+    return [t for t in ids if t != tokenizer.eos_token_id and t != tokenizer.pad_token_id]
+
+
+def generate_hf(model, tokenizer, prompts, max_new_tokens, need_scores, device):
+    """[(text, gen_ids, token_logprobs)] from model.generate(); the ids and log-probabilities are
+    None without the confidence filter."""
+    enc = tokenizer(prompts, return_tensors="pt", padding=True, truncation=True, max_length=1024).to(device)
+    with torch.no_grad():
+        out = model.generate(**enc, max_new_tokens=max_new_tokens, do_sample=False,
+                             pad_token_id=tokenizer.eos_token_id,
+                             return_dict_in_generate=need_scores, output_scores=need_scores)
+    if need_scores:
+        sequences = out.sequences
+        # [bs, gen_len] logprob of each generated token — no extra forward
+        trans = model.compute_transition_scores(sequences, out.scores, normalize_logits=True).float().cpu()
+    else:
+        sequences = out
+    gen_ids_batch = sequences[:, enc["input_ids"].shape[1]:].cpu()
+    texts = tokenizer.batch_decode(gen_ids_batch, skip_special_tokens=True)
+    if not need_scores:
+        return [(text, None, None) for text in texts]
+    return [(text, strip_stop(gen_ids_batch[pos].tolist(), tokenizer), trans[pos]) for pos, text in enumerate(texts)]
+
+
+def generate_vllm(teacher, tokenizer, prompts, max_new_tokens, need_scores, work_dir, vllm_py):
+    """generate_hf's results from vLLM, with the settings generate() would use (gen_backend.py)."""
+    if not prompts:
+        return []
+    config = resolve_generation_config(meta_model(teacher), None, do_sample=False, pad_token_id=tokenizer.eos_token_id)
+    requests = [{"prompt_token_ids": ids, "max_tokens": max_new_tokens, "seed": 0}
+                for ids in tokenizer(prompts, truncation=True, max_length=1024)["input_ids"]]
+    outputs = run_vllm(work_dir, teacher, requests, vllm_params(config, logprobs=need_scores), vllm_py=vllm_py)
+    shutil.rmtree(work_dir, ignore_errors=True)
+    texts = tokenizer.batch_decode([output["token_ids"] for output in outputs], skip_special_tokens=True)
+    if not need_scores:
+        return [(text, None, None) for text in texts]
+    return [(text, strip_stop(output["token_ids"], tokenizer), torch.tensor(output["logprobs"], dtype=torch.float32))
+            for output, text in zip(outputs, texts)]
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--teacher", required=True)
@@ -119,6 +174,8 @@ def main():
                     help="keep the top p%% highest-scored events of the task")
     ap.add_argument("--conf-thresh", type=float, default=None,
                     help="absolute mean-logprob cutoff (e.g. -0.5)")
+    ap.add_argument("--gen-backend", choices=["hf", "vllm"], default="hf",
+                    help="vllm: the teacher's answers come from vLLM (gen_backend.py), same settings")
     args = ap.parse_args()
 
     if args.conf_filter == "thresh" and args.conf_thresh is None:
@@ -145,11 +202,7 @@ def main():
 
     rows = [json.loads(l) for l in open(os.path.join(args.data_dir, "train.jsonl"))]
 
-    device = f"cuda:{args.gpu}"
     tokenizer = AutoTokenizer.from_pretrained(args.teacher, padding_side="left")
-    model = AutoModelForCausalLM.from_pretrained(args.teacher, torch_dtype=torch.bfloat16,
-                                                 device_map={"": device})
-    model.eval()
 
     need_scores = args.conf_filter != "none"
 
@@ -167,43 +220,29 @@ def main():
     pending = {}   # row_idx -> list of (event, score)
     n_dropped_conflict = 0
     n_seen = 0
-    for b in range(0, len(cand_idx), args.batch_size):
-        idxs = cand_idx[b:b + args.batch_size]
-        prompts = []
-        for i in idxs:
-            r = rows[i]
-            prompts.append(tokenizer.apply_chat_template(
-                [{"role": "system", "content": r["system_prompt"]},
-                 {"role": "user", "content": r["user_prompt"]}],
-                add_generation_prompt=True, tokenize=False, enable_thinking=False))
-        enc = tokenizer(prompts, return_tensors="pt", padding=True,
-                        truncation=True, max_length=1024).to(device)
-        with torch.no_grad():
-            out = model.generate(**enc, max_new_tokens=args.max_new_tokens,
-                                 do_sample=False, pad_token_id=tokenizer.eos_token_id,
-                                 return_dict_in_generate=need_scores,
-                                 output_scores=need_scores)
-        if need_scores:
-            sequences = out.sequences
-            # [bs, gen_len] logprob of each generated token — no extra forward
-            trans = model.compute_transition_scores(
-                sequences, out.scores, normalize_logits=True).float().cpu()
-        else:
-            sequences = out
-        gen_ids_batch = sequences[:, enc["input_ids"].shape[1]:].cpu()
-        texts = tokenizer.batch_decode(gen_ids_batch, skip_special_tokens=True)
-
-        for pos, (i, text) in enumerate(zip(idxs, texts)):
+    if args.gen_backend == "vllm":
+        vllm_py, version = find_vllm_python()
+        print(f"generation backend: vLLM {version} ({vllm_py})", flush=True)
+        chunks = [(cand_idx, generate_vllm(args.teacher, tokenizer, chat_prompts(tokenizer, rows, cand_idx),
+                                           args.max_new_tokens, need_scores, os.path.join(args.out, "vllm_tmp"),
+                                           vllm_py))]
+    else:
+        device = f"cuda:{args.gpu}"
+        model = AutoModelForCausalLM.from_pretrained(args.teacher, torch_dtype=torch.bfloat16,
+                                                     device_map={"": device})
+        model.eval()
+        chunks = ((cand_idx[b:b + args.batch_size],
+                   generate_hf(model, tokenizer, chat_prompts(tokenizer, rows, cand_idx[b:b + args.batch_size]),
+                               args.max_new_tokens, need_scores, device))
+                  for b in range(0, len(cand_idx), args.batch_size))
+    n_done = 0
+    for idxs, generated in chunks:
+        for i, (text, gid, lp) in zip(idxs, generated):
             r = rows[i]
             sent = input_text_of(r["user_prompt"]) or ""
             gold = json.loads(r["response"]).get("events", [])
             gold_keys = {(e[0], e[1]) for e in gold}
             gold_triggers = {str(e[0]).lower() for e in gold if isinstance(e, list) and e}
-            if need_scores:
-                # strip padding/eos from the id/logprob views
-                gid = [t for t in gen_ids_batch[pos].tolist()
-                       if t != tokenizer.eos_token_id and t != tokenizer.pad_token_id]
-                lp = trans[pos]
             for e in parse_events(text):
                 if not isinstance(e, list) or len(e) < 2:
                     continue
@@ -240,7 +279,8 @@ def main():
                     # pseudo events (pseudo-vs-pseudo conflicts, not just gold)
                     gold_triggers.add(trig.lower())
                 n_seen += 1
-        print(f"pseudo-label {min(b + args.batch_size, len(cand_idx))}/{len(cand_idx)} "
+        n_done += len(idxs)
+        print(f"pseudo-label {n_done}/{len(cand_idx)} "
               f"(candidates so far: {n_seen}, conflict-dropped: {n_dropped_conflict})", flush=True)
 
     # pass 2: H1 confidence filter over the whole task, then merge
