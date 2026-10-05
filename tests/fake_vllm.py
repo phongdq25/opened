@@ -6,6 +6,8 @@ FAKE_VLLM_MODE picks the answers:
   replay              the records in the JSON file FAKE_VLLM_REPLAY, in order
   short               like checksum, one answer short
   fail                print "boom" and exit 3
+  fail_once           like fail on the first logged call, like checksum afterwards
+  hang                sleep for an hour
 FAKE_VLLM_LOG, when set, gets one JSON line per call: the arguments, the environment, the
 requests, the params and the files in --lora."""
 import argparse
@@ -31,6 +33,11 @@ def main():
                                 "lora_files": sorted(os.listdir(a.lora)) if a.lora and os.path.isdir(a.lora)
                                 else None}) + "\n")
     mode = os.environ.get("FAKE_VLLM_MODE", "checksum")
+    if mode == "hang":
+        import time
+        time.sleep(3600)
+    if mode == "fail_once":
+        mode = "fail" if len(open(os.environ["FAKE_VLLM_LOG"]).read().splitlines()) == 1 else "checksum"
     if mode == "fail":
         print("boom")
         sys.exit(3)

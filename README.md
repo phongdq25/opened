@@ -200,8 +200,12 @@ Same experiments, same objectives, much less wall-clock. What changed and how to
     `uv venv .venv-vllm --python 3.12 && uv pip install --python .venv-vllm vllm==0.27.1`.
   - `VLLM_GPU_GB` (default 10) is each vLLM instance's memory budget; the instance holds about
     12 GB on the card at the default. `VLLM_EAGER=1` turns off CUDA graphs.
-  - On H200-class cards `GEN_BACKEND` defaults to `vllm` when a vLLM environment is found
-    (`scripts/qwen/lib.sh`), and to `hf` everywhere else. Measured against Hugging Face on
+  - vLLM runs as an ordinary CUDA process even when the scheduler uses MPS (that is how it was
+    checked). A failed vLLM start is retried once without CUDA graphs, and a vLLM that hangs is
+    stopped after `VLLM_TIMEOUT_S` (default 1,200 s plus 0.5 s per row).
+  - On H200-class cards `GEN_BACKEND` defaults to `vllm` when the tested vLLM 0.27.x is found
+    (`scripts/qwen/lib.sh`), and to `hf` everywhere else. Another vLLM version works only when
+    `GEN_BACKEND=vllm` is set explicitly, with a warning. Measured against Hugging Face on
     1× H200 NVL, next to running jobs (`tools/gen_parity.py`):
 
     | check | result |

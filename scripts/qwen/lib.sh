@@ -42,9 +42,9 @@ apply_card_defaults () {
     [ "${d_phys}" = "-" ] || export PHYS_BS=${PHYS_BS:-${d_phys}}
     [ "${d_gpu}" = "-" ] || export NEED_GPU_MB=${NEED_GPU_MB:-${d_gpu}}
     [ "${d_lora}" = "-" ] || export NEED_LORA_MB=${NEED_LORA_MB:-${d_lora}}
-    # vLLM only where gen_backend.find_vllm_python() finds an environment for it
-    if [ "${d_gen}" = "vllm" ] && ! "${PY:-python3}" -c "from gen_backend import find_vllm_python; find_vllm_python()" \
-            > /dev/null 2>&1; then
+    # vLLM only where gen_backend.find_vllm_python() finds the tested version (vllm_supported)
+    if [ "${d_gen}" = "vllm" ] && ! "${PY:-python3}" -c "import sys; from gen_backend import find_vllm_python, \
+vllm_supported; sys.exit(0 if vllm_supported(find_vllm_python()[1]) else 1)" > /dev/null 2>&1; then
         d_gen=hf
     fi
     export GEN_BACKEND=${GEN_BACKEND:-${d_gen}}

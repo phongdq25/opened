@@ -11,14 +11,22 @@ import hashlib
 import json
 import os
 import subprocess
+import sys
+import time
 
 REPO = os.path.dirname(os.path.abspath(__file__))
 VLLM_SCRIPT = os.path.join(REPO, "tools", "vllm_generate.py")
 VLLM_CANDIDATES = (os.path.join(REPO, ".venv-vllm", "bin", "python"), "/venv/main/bin/python")
 EAGER_DEFAULT = "0"      # VLLM_EAGER unset: "1" = no CUDA graphs (decided by measurement, plan Task 7)
+# tools/vllm_generate.py relies on this line's kv_cache_memory_bytes, LoRA ranks, top_k=0 and raw
+# log-probabilities, and every parity check ran on 0.27.1
+TESTED_VLLM = "0.27."
 # torchrun sets these; a vLLM child that inherits them can try to join the trainer's process group
 TORCHRUN_VARS = ("RANK", "LOCAL_RANK", "WORLD_SIZE", "LOCAL_WORLD_SIZE", "GROUP_RANK", "GROUP_WORLD_SIZE",
                  "ROLE_NAME", "ROLE_RANK", "ROLE_WORLD_SIZE", "MASTER_ADDR", "MASTER_PORT")
+# vLLM runs outside CUDA MPS: every vLLM run that was checked ran as an ordinary CUDA process next to
+# MPS clients (the scheduler's trainers); vLLM as an MPS client never was
+MPS_VARS = ("CUDA_MPS_PIPE_DIRECTORY", "CUDA_MPS_LOG_DIRECTORY")
 # GenerationConfig fields vLLM has no equivalent for, each with the value that means "not used"
 UNSUPPORTED = {
     "num_beams": 1, "num_beam_groups": 1, "penalty_alpha": None, "no_repeat_ngram_size": 0,
@@ -83,9 +91,10 @@ def row_seed(seed, split, epoch, index):
 
 
 def child_env(cuda=True):
-    """The environment of a vLLM process: without torchrun's variables and the repo's PYTHONPATH."""
+    """The environment of a vLLM process: without torchrun's variables, the MPS pipe and the repo's
+    PYTHONPATH."""
     env = {k: v for k, v in os.environ.items()
-           if k not in TORCHRUN_VARS and k != "PYTHONPATH" and not k.startswith("TORCHELASTIC_")}
+           if k not in TORCHRUN_VARS + MPS_VARS and k != "PYTHONPATH" and not k.startswith("TORCHELASTIC_")}
     env.setdefault("VLLM_LOGGING_LEVEL", "WARNING")
     env["VLLM_NO_USAGE_STATS"] = "1"
     env["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"      # engine in-process: one short-lived process per call
@@ -94,9 +103,15 @@ def child_env(cuda=True):
     return env
 
 
+def vllm_supported(version):
+    """Is this the vLLM line tools/vllm_generate.py was written and checked against?"""
+    return version.startswith(TESTED_VLLM)
+
+
 def find_vllm_python():
     """(interpreter, vLLM version) of the vLLM environment: VLLM_PY when it is set (no fallback),
-    else the first of VLLM_CANDIDATES that imports vllm."""
+    else the first of VLLM_CANDIDATES that imports vllm. An untested version is reported on stderr;
+    the H200 default (scripts/qwen/lib.sh) only picks vLLM when vllm_supported() holds."""
     candidates = [os.environ["VLLM_PY"]] if os.environ.get("VLLM_PY") else list(VLLM_CANDIDATES)
     for python in candidates:
         if not os.path.exists(python):
@@ -105,6 +120,10 @@ def find_vllm_python():
                              capture_output=True, text=True, env=child_env(cuda=False), timeout=600)
         versions = [line.split()[1] for line in out.stdout.splitlines() if line.startswith("VLLM_VERSION ")]
         if out.returncode == 0 and versions:
+            if not vllm_supported(versions[-1]):
+                print(f"WARNING: vLLM {versions[-1]} at {python} is not the tested {TESTED_VLLM}x: "
+                      "tools/vllm_generate.py relies on its KV-cache sizing, LoRA ranks, top_k=0 and raw "
+                      "log-probabilities, so answers may differ or generation may fail", file=sys.stderr)
             return python, versions[-1]
     raise RuntimeError(f"no vLLM environment (tried {', '.join(candidates)}): set VLLM_PY, or create one with "
                        "`uv venv .venv-vllm --python 3.12 && uv pip install --python .venv-vllm vllm==0.27.1`")
@@ -132,26 +151,42 @@ def run_vllm(work_dir, model_dir, requests, params, lora_dir=None, max_lora_rank
            "--gpu-memory-gb", os.environ.get("VLLM_GPU_GB", "10")]
     if lora_dir is not None:
         cmd += ["--lora", lora_dir, "--max-lora-rank", str(max_lora_rank)]
-    if os.environ.get("VLLM_EAGER", EAGER_DEFAULT) == "1":
-        cmd.append("--enforce-eager")
     try:
         import torch
         if torch.cuda.is_available():
             torch.cuda.empty_cache()          # hand the training step's cached blocks back to the card
     except ImportError:
         pass
-    with open(paths["vllm.log"], "w") as log:
-        returncode = subprocess.run(cmd, stdout=log, stderr=subprocess.STDOUT, env=child_env()).returncode
-    if returncode != 0:
-        tail = open(paths["vllm.log"], errors="replace").read().splitlines()[-50:]
-        raise RuntimeError(f"vLLM generation failed (exit {returncode}); last lines of {paths['vllm.log']}:\n"
-                           + "\n".join(tail))
+    # one retry without CUDA graphs: a start-up hiccup on a busy card (free memory, compile cache)
+    # should not throw away the training a multi-task run cannot resume; a hang gets a time limit
+    timeout = float(os.environ.get("VLLM_TIMEOUT_S", 1200 + 0.5 * len(requests)))
+    failures = []
+    for attempt, (log_name, eager) in enumerate((("vllm.log", os.environ.get("VLLM_EAGER", EAGER_DEFAULT) == "1"),
+                                                 ("vllm.retry.log", True))):
+        log_path = os.path.join(work_dir, log_name)
+        try:
+            with open(log_path, "w") as log:
+                returncode = subprocess.run(cmd + (["--enforce-eager"] if eager else []), stdout=log,
+                                            stderr=subprocess.STDOUT, env=child_env(), timeout=timeout).returncode
+            problem = None if returncode == 0 else f"exit {returncode}"
+        except subprocess.TimeoutExpired:
+            problem = f"no answer after {timeout:.0f} s"
+        if problem is None:
+            break
+        tail = open(log_path, errors="replace").read().splitlines()[-50:]
+        failures.append(f"attempt {attempt + 1}: {problem}; last lines of {log_path}:\n" + "\n".join(tail))
+        if attempt == 0:
+            print(f"vLLM generation failed ({problem}); retrying once without CUDA graphs", flush=True)
+            time.sleep(float(os.environ.get("VLLM_RETRY_WAIT_S", "30")))
+    else:
+        raise RuntimeError("vLLM generation failed twice:\n" + "\n\n".join(failures))
     outputs = [json.loads(line) for line in open(paths["outputs.jsonl"])]
     if len(outputs) != len(requests):
         raise RuntimeError(f"vLLM returned {len(outputs)} answers for {len(requests)} requests "
                            f"({paths['outputs.jsonl']})")
-    for path in paths.values():
-        os.remove(path)
+    for path in list(paths.values()) + [os.path.join(work_dir, "vllm.retry.log")]:
+        if os.path.exists(path):
+            os.remove(path)
     return outputs
 
 

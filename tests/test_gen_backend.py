@@ -68,6 +68,8 @@ def test_run_vllm_round_trip_without_torchruns_variables(fake_vllm, tmp_path, mo
         monkeypatch.setenv(var, "1")
     monkeypatch.setenv("PYTHONPATH", "/somewhere")
     monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "3")
+    monkeypatch.setenv("CUDA_MPS_PIPE_DIRECTORY", "/somewhere/.mps/pipe")
+    monkeypatch.setenv("CUDA_MPS_LOG_DIRECTORY", "/somewhere/.mps/log")
     work = tmp_path / "work"
     requests = [request([5, 6], seed=1), request([7, 8, 9], seed=2)]
     out = run_vllm(str(work), "some/model", requests, {**GREEDY, "logprobs": True}, lora_dir="some/adapter",
@@ -81,7 +83,7 @@ def test_run_vllm_round_trip_without_torchruns_variables(fake_vllm, tmp_path, mo
     env = call["env"]
     assert env["CUDA_VISIBLE_DEVICES"] == "3" and env["VLLM_ENABLE_V1_MULTIPROCESSING"] == "0"
     assert not {"RANK", "LOCAL_RANK", "WORLD_SIZE", "MASTER_ADDR", "MASTER_PORT", "TORCHELASTIC_RUN_ID",
-                "PYTHONPATH"} & set(env)
+                "PYTHONPATH", "CUDA_MPS_PIPE_DIRECTORY", "CUDA_MPS_LOG_DIRECTORY"} & set(env)   # vLLM runs outside MPS
     assert os.listdir(work) == []                                     # the files go once it worked
 
 
@@ -95,10 +97,33 @@ def test_a_short_answer_file_fails_loudly(fake_vllm, tmp_path, monkeypatch):
 def test_a_vllm_crash_fails_with_its_last_log_lines_and_keeps_them(fake_vllm, tmp_path, monkeypatch):
     from gen_backend import run_vllm
     monkeypatch.setenv("FAKE_VLLM_MODE", "fail")
+    monkeypatch.setenv("VLLM_RETRY_WAIT_S", "0")
     work = tmp_path / "w"
-    with pytest.raises(RuntimeError, match="(?s)exit 3.*boom"):
+    with pytest.raises(RuntimeError, match="(?s)failed twice.*exit 3.*boom.*exit 3.*boom"):
         run_vllm(str(work), "m", [request([1])], GREEDY, vllm_py=fake_vllm.python)
-    assert "boom" in (work / "vllm.log").read_text()
+    assert "boom" in (work / "vllm.log").read_text() and "boom" in (work / "vllm.retry.log").read_text()
+
+
+def test_a_failed_start_is_retried_once_without_cuda_graphs(fake_vllm, tmp_path, monkeypatch):
+    from gen_backend import run_vllm
+    monkeypatch.setenv("FAKE_VLLM_MODE", "fail_once")
+    monkeypatch.setenv("VLLM_RETRY_WAIT_S", "0")
+    out = run_vllm(str(tmp_path / "w"), "m", [request([5, 6])], GREEDY, vllm_py=fake_vllm.python)
+    assert out == [{"token_ids": [111, 151645]}]
+    first, second = fake_vllm.calls()
+    assert (first["args"]["enforce_eager"], second["args"]["enforce_eager"]) == (False, True)
+
+
+def test_a_hung_vllm_times_out(fake_vllm, tmp_path, monkeypatch):
+    import time
+    from gen_backend import run_vllm
+    monkeypatch.setenv("FAKE_VLLM_MODE", "hang")
+    monkeypatch.setenv("VLLM_RETRY_WAIT_S", "0")
+    monkeypatch.setenv("VLLM_TIMEOUT_S", "2")
+    start = time.time()
+    with pytest.raises(RuntimeError, match="no answer after 2 s"):
+        run_vllm(str(tmp_path / "w"), "m", [request([1])], GREEDY, vllm_py=fake_vllm.python)
+    assert time.time() - start < 60
 
 
 def test_no_requests_start_no_vllm(fake_vllm, tmp_path):
@@ -110,6 +135,22 @@ def test_no_requests_start_no_vllm(fake_vllm, tmp_path):
 def test_find_vllm_python_takes_vllm_py_and_its_version(fake_vllm):
     from gen_backend import find_vllm_python
     assert find_vllm_python() == (fake_vllm.python, "0.27.1")
+
+
+@pytest.mark.parametrize("version,tested", [("0.27.1", True), ("0.27.0", True), ("0.28.0", False), ("0.11.2", False)])
+def test_only_the_tested_vllm_line_counts_as_supported(version, tested):
+    from gen_backend import vllm_supported
+    assert vllm_supported(version) is tested
+
+
+def test_an_untested_vllm_version_is_reported(monkeypatch, tmp_path, capsys):
+    from gen_backend import find_vllm_python
+    python = tmp_path / "py"
+    python.write_text('#!/bin/bash\necho "VLLM_VERSION 0.30.0"\n')
+    python.chmod(0o755)
+    monkeypatch.setenv("VLLM_PY", str(python))
+    assert find_vllm_python() == (str(python), "0.30.0")
+    assert "not the tested 0.27" in capsys.readouterr().err
 
 
 def test_find_vllm_python_does_not_fall_back_when_vllm_py_is_set(fake_vllm, monkeypatch, tmp_path):
