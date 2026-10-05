@@ -17,11 +17,12 @@ on the rows whose loss reads it.
 """
 from dataclasses import dataclass
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 
-from ced_losses import (IGNORE, compute_overall_span_loss, get_distil_loss, label_window, sd_group_loss,
-                        sd_student_logits)
+from ced_losses import (IGNORE, compute_overall_span_loss, generate_replay_rows, get_distil_loss, label_window,
+                        replace_batch_rows, sd_group_loss, sd_student_logits, select_batch_rows)
 
 
 def group_slices(n_rows, group_size):
@@ -201,3 +202,58 @@ def grouped_ce_loss(model, model_batch, label, group_size):
         terms.append(F.cross_entropy(logits[gs][pos].float(), lab[gs][pos]) if pos.any()
                      else torch.tensor(0.0, device=label.device))
     return torch.stack(terms).mean()
+
+
+def distillm_replace_groups(args, groups, model, student_generator, replay_buffer, model_batch, no_model_batch,
+                            gen_data, samp_threshold, adaptive_threshold, device, log=print):
+    """DistiLLM/AMiD student generation as 4257d86 does it per micro-batch. Each group gets
+    one draw and one generate / sample-from-buffer decision, in group order, against the
+    buffer size the earlier groups leave. The rows to generate are generated in a single
+    call. Buffer pushes and samples then replay in group order, so every sample sees the
+    same buffer as before."""
+    is_replay = no_model_batch["is_replay"]
+    buffered = len(replay_buffer)
+    plan = []
+    for gs in groups:
+        r = np.random.uniform(0, 1)
+        idx = is_replay[gs].nonzero(as_tuple=False).flatten() + gs.start
+        count = len(idx)
+        should_generate = (("mixed" in args.type and r < args.mixed_alpha)
+                           or ("adaptive" in args.type and (
+                               r < samp_threshold or (r < adaptive_threshold and buffered < args.capacity))))
+        should_sample = "adaptive" in args.type and r < adaptive_threshold and buffered >= count
+        if count and should_generate:
+            plan.append(("generate", idx))
+            buffered = min(buffered + count, args.capacity)
+        elif count and should_sample:
+            plan.append(("sample", idx))
+        else:
+            plan.append(None)
+
+    to_generate = [i for p in plan if p and p[0] == "generate" for i in p[1].tolist()]
+    if to_generate:
+        position = {row: k for k, row in enumerate(to_generate)}
+        gen_model, gen_meta, gen_inputs = generate_replay_rows(
+            args, student_generator, model, gen_data, no_model_batch,
+            torch.tensor(to_generate, device=is_replay.device))
+    for step in plan:
+        if step is None:
+            continue
+        kind, idx = step
+        if kind == "generate":
+            sel = torch.tensor([position[i] for i in idx.tolist()], device=is_replay.device)
+            rows_model = select_batch_rows(gen_model, sel)
+            rows_meta = select_batch_rows(gen_meta, sel)
+            replay_buffer.move_to_memory(rows_model, rows_meta, select_batch_rows(gen_inputs, sel))
+            if "mixed" in args.type:
+                rows_model, rows_meta, _ = replay_buffer.sample(len(idx))
+                rows_model, rows_meta, _ = replay_buffer.move_to_device(rows_model, rows_meta, None, device)
+            log(f"student-gen replay insert: {len(idx)}, buffer={len(replay_buffer)}")
+        else:
+            rows_model, rows_meta, rows_gen = replay_buffer.sample(len(idx))
+            rows_model, rows_meta, rows_gen = replay_buffer.move_to_device(rows_model, rows_meta, rows_gen, device)
+            log(f"student-gen replay sample: {len(idx)}, buffer={len(replay_buffer)}")
+        model_batch = replace_batch_rows(model_batch, rows_model, idx)
+        no_model_batch = replace_batch_rows(no_model_batch, rows_meta, idx)
+    model.train()
+    return model_batch, no_model_batch
