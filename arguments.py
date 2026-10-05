@@ -253,6 +253,9 @@ def add_gen_args(parser: argparse.ArgumentParser):
     group.add_argument("--gen-backend", choices=["hf", "vllm"], default="hf",
                        help="hf: answers come from model.generate(); vllm: from tools/vllm_generate.py in the "
                             "vLLM environment, with the settings generate() would use (gen_backend.py)")
+    group.add_argument("--compile-generation", action="store_true",
+                       help="sample inside training steps (self-distillation, DistiLLM/AMiD) with a static KV "
+                            "cache, which transformers compiles (gen_config.train_generation_kwargs)")
 
     return parser
 

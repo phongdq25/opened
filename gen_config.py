@@ -11,3 +11,14 @@ every config means what it says (greedy evaluation, the requested SD and DistiLL
 def generation_kwargs(args):
     """Extra keyword arguments for every model.generate(generation_config=...) call."""
     return {"use_model_defaults": False} if getattr(args, "strict_generation", False) else {}
+
+
+def train_generation_kwargs(args):
+    """generation_kwargs(args) for the generate() calls inside training steps (self-distillation,
+    DistiLLM/AMiD). With --compile-generation they also ask for a static KV cache, and transformers
+    then compiles the decoding forward (CUDA graphs). Evaluation keeps generation_kwargs: its batch
+    sizes vary from call to call, and every new size would cost a compile."""
+    kwargs = generation_kwargs(args)
+    if getattr(args, "compile_generation", False):
+        kwargs["cache_implementation"] = "static"
+    return kwargs

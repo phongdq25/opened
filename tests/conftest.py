@@ -108,6 +108,7 @@ def ced_args(**overrides):
         strict_generation=False, eval_batch_size=32, eval_loss_batch_size=32, eval_gen=True,
         eval_gen_mode="every", do_sample=False, top_p=0.95, top_k=0, temperature=0.5,
         repetition_penalty=None, num_workers=0, save=None, gen_backend="hf", vllm_py=None, model_path=None,
+        compile_generation=False,
     )
     base.update(overrides)
     return Namespace(**base)
