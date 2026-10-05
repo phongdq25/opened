@@ -23,6 +23,7 @@ import hashlib
 import json
 import os
 import random
+import shutil
 
 import numpy as np
 import torch
@@ -41,6 +42,8 @@ from cl_lora.multi_adapter import CLLoRAManager, lora_layers
 from cl_lora import migu as migu_mod
 from cl_lora import treelora as tree_mod
 from cl_lora import gainlora as gain_mod
+from cl_lora.vllm_export import WHOLE, effective_backend, export_summed_adapters
+from gen_backend import find_vllm_python, meta_model, resolve_generation_config, run_vllm, unpadded_prompts, vllm_params
 from cl_lora.inflora import ActivationCollector, DualGPM, design_B
 from cl_lora.epi import (
     MahalanobisRouter,
@@ -86,6 +89,9 @@ def parse_args():
     p.add_argument("--limit", type=int, default=-1, help="truncate each split to N rows (debug/smoke)")
     p.add_argument("--save", required=True)
     p.add_argument("--resume", action="store_true")
+    p.add_argument("--gen-backend", choices=["hf", "vllm"], default="hf",
+                   help="vllm: evaluation answers from vLLM (cl_lora/vllm_export.py); "
+                        "GainLoRA and EPI keep Hugging Face generation")
     return p.parse_args()
 
 
@@ -205,6 +211,8 @@ def runtime_fingerprint():
         os.path.join(module_root, "migu.py"),
         os.path.join(module_root, "multi_adapter.py"),
         os.path.join(module_root, "treelora.py"),
+        os.path.join(module_root, "vllm_export.py"),
+        os.path.join(project_root, "gen_backend.py"),
     ])
 
 
@@ -447,6 +455,30 @@ def _generate(a, model, tok, mb):
     return tok.batch_decode(gen[:, mb["input_ids"].size(1):], skip_special_tokens=True)
 
 
+def cl_generation_config(model, tok):
+    """The settings _generate()'s generate() call decodes with."""
+    return resolve_generation_config(model, None, do_sample=False, eos_token_id=[tok.eos_token_id, 151643],
+                                     pad_token_id=tok.pad_token_id)
+
+
+def _vllm_generate(a, model, tok, mgr, prompts):
+    """Greedy answers from vLLM for the evaluated model (cl_lora/vllm_export.py)."""
+    params = vllm_params(cl_generation_config(model, tok))
+    requests = [{"prompt_token_ids": prompt, "max_tokens": a.max_length - a.max_prompt_length, "seed": 0}
+                for prompt in prompts]
+    work_dir = os.path.join(a.save, "vllm_tmp")
+    if a.cl_method in WHOLE:
+        model_dir, lora_dir, rank = os.path.join(work_dir, "model"), None, 0
+        model.save_pretrained(model_dir, safe_serialization=True)
+    else:
+        model_dir, lora_dir = a.model_path, os.path.join(work_dir, "adapter")
+        rank = export_summed_adapters(model, mgr.task_adapters, a.model_path, lora_dir)
+    outputs = run_vllm(work_dir, model_dir, requests, params, lora_dir=lora_dir, max_lora_rank=rank,
+                       max_model_len=a.max_length, vllm_py=a.vllm_py)
+    shutil.rmtree(work_dir, ignore_errors=True)
+    return tok.batch_decode([output["token_ids"] for output in outputs], skip_special_tokens=True)
+
+
 @torch.no_grad()
 def eval_task(a, model, tok, device, upto, mgr, router=None, gates=None):
     ds = JsonlED(os.path.join(a.data_root, str(upto), "test.jsonl"),
@@ -456,6 +488,13 @@ def eval_task(a, model, tok, device, upto, mgr, router=None, gates=None):
         mgr.consolidate()                              # activate all branches (summed forward)
     preds, refs = [], []
     model.eval()
+    if effective_backend(a.cl_method, a.gen_backend) == "vllm":
+        prompts = []
+        for mb, answers in loader:
+            prompts.extend(unpadded_prompts(mb["input_ids"], mb["attention_mask"]))
+            refs.extend([[x] for x in answers])
+        preds = _vllm_generate(a, model, tok, mgr, prompts)
+        return ed_evaluate(preds, refs), preds, refs
     for mb, answers in loader:
         mb = {k: v.to(device) for k, v in mb.items()}
         if router is not None:                         # EPI: route each example to its task adapter
@@ -480,28 +519,14 @@ def eval_task(a, model, tok, device, upto, mgr, router=None, gates=None):
     return metrics, preds, refs
 
 
-def main():
-    a = parse_args()
-    if a.loss_group_size is None:
-        a.loss_group_size = a.batch_size
-    if a.batch_size % a.loss_group_size:
-        raise ValueError(f"--batch-size {a.batch_size} is not a multiple of --loss-group-size {a.loss_group_size}")
-    if a.cl_method == "migu" and a.loss_group_size != a.batch_size:
-        raise ValueError("MIGU builds its gradient mask from each step's activations: "
-                         "--batch-size must equal --loss-group-size")
-    random.seed(a.seed)
-    np.random.seed(a.seed)
-    torch.manual_seed(a.seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(a.seed)
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    os.makedirs(a.save, exist_ok=True)
-    complete_marker = os.path.join(a.save, ".complete")
-    if os.path.exists(complete_marker):
-        raise FileExistsError(f"run already complete: {a.save}")
-    manifest_path = os.path.join(a.save, "run_manifest.json")
-    checkpoint_path = os.path.join(a.save, "checkpoint_latest.pt")
-    requested_manifest = {
+RESUME_KEYS = ("method", "data_root", "seed", "model", "rank", "alpha", "dropout", "data_sha256", "runtime_sha256",
+               "micro_batch", "gradient_accumulation", "loss_group_size", "epochs", "num_tasks", "row_limit",
+               "scheduler", "prompt_mode", "gen_backend")
+
+
+def manifest_for(a):
+    """The run manifest a new run writes and a resumed run must match on RESUME_KEYS."""
+    return {
         "method": a.cl_method,
         "data_root": os.path.abspath(a.data_root),
         "seed": a.seed,
@@ -522,19 +547,46 @@ def main():
         "warmup_ratio": a.warmup_ratio,
         "prompt_mode": "qwen_chat_template_thinking_disabled",
         "decoding": "greedy",
+        "gen_backend": effective_backend(a.cl_method, a.gen_backend),
         "status": "running",
         "completed_task": -1,
     }
+
+
+def main():
+    a = parse_args()
+    if a.loss_group_size is None:
+        a.loss_group_size = a.batch_size
+    if a.batch_size % a.loss_group_size:
+        raise ValueError(f"--batch-size {a.batch_size} is not a multiple of --loss-group-size {a.loss_group_size}")
+    if a.cl_method == "migu" and a.loss_group_size != a.batch_size:
+        raise ValueError("MIGU builds its gradient mask from each step's activations: "
+                         "--batch-size must equal --loss-group-size")
+    a.vllm_py = None
+    if effective_backend(a.cl_method, a.gen_backend) == "vllm":
+        # before the run directory exists: a refused run leaves nothing to clean up
+        a.vllm_py, version = find_vllm_python()
+        vllm_params(cl_generation_config(meta_model(a.model_path), AutoTokenizer.from_pretrained(a.model_path)))
+        print(f"[cl:{a.cl_method}] generation backend: vLLM {version} ({a.vllm_py})", flush=True)
+    random.seed(a.seed)
+    np.random.seed(a.seed)
+    torch.manual_seed(a.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(a.seed)
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    os.makedirs(a.save, exist_ok=True)
+    complete_marker = os.path.join(a.save, ".complete")
+    if os.path.exists(complete_marker):
+        raise FileExistsError(f"run already complete: {a.save}")
+    manifest_path = os.path.join(a.save, "run_manifest.json")
+    checkpoint_path = os.path.join(a.save, "checkpoint_latest.pt")
+    requested_manifest = manifest_for(a)
     if os.path.exists(manifest_path):
         if not a.resume:
             raise FileExistsError(f"partial run exists; pass --resume or use a new path: {a.save}")
         with open(manifest_path, encoding="utf-8") as manifest_file:
             manifest = json.load(manifest_file)
-        for key in (
-            "method", "data_root", "seed", "model", "rank", "alpha", "dropout",
-            "data_sha256", "runtime_sha256", "micro_batch", "gradient_accumulation", "loss_group_size",
-            "epochs", "num_tasks", "row_limit", "scheduler", "prompt_mode"
-        ):
+        for key in RESUME_KEYS:
             if manifest.get(key) != requested_manifest.get(key):
                 raise ValueError(
                     f"resume manifest mismatch for {key}: "
