@@ -99,7 +99,8 @@ The one difference: `drop_last` now drops up to `P−1` rows per epoch instead o
 | CL-LoRA | 2 (CRE) or 32 (CED) |
 
 `P` and `G'` are new runner settings, `PHYS_BS` and the accumulation derived from it.
-Their defaults come from §9.
+The runner scripts default to `P = g`, which is safe on the authors' 46 GB cards. The two
+schedulers, `project_commands.sh` and `run.sh`, set the H200 default measured in §9.
 
 ### 2. Training step (`ced_step.py`, used by `ced_finetune.py` and `finetune.py`)
 
@@ -116,8 +117,11 @@ Changes inside the step that leave the result unchanged:
 
 1. **Dynamic padding** (`--dynamic-pad`: off in the code, on in the runners). The collate
    pads to the longest row in the batch, rounded up to a multiple of 64, instead of to
-   768. It is forced off for `--student-gen` (DistiLLM, AMiD), whose replay buffer stores
-   768-wide rows.
+   768. It is forced off in two cases:
+   - with `--student-gen` (DistiLLM, AMiD), whose replay buffer stores 768-wide rows;
+   - whenever the span loss is on (`--w-span-loss != 0`, i.e. Ours and its ablations).
+     `compute_token_weights` averages attention over every query position, padded ones
+     included, so padding length changes the span loss.
 2. **Label-window logits.** The student forward passes `logits_to_keep` set to the
    position range that holds the batch's labels. This is supported by the pinned
    transformers, `modeling_qwen3.py:493`. CE and KD gather their positions from that
@@ -246,7 +250,7 @@ Today `DistributedMMapIndexedDataset.__getitem__` loops forever in that case
 | Setting | Where | Default | Effect |
 |---|---|---|---|
 | `--loss-group-size` | ced_finetune, finetune, engine | `--batch-size` | logical micro-batch |
-| `PHYS_BS` | runner scripts | from §9 | physical batch |
+| `PHYS_BS` | runner scripts (read), schedulers (set) | `g` in the runners; §9 value in the schedulers | physical batch |
 | `--eval-gen-mode` | ced_finetune, finetune | `every` (runners: `final`) | when answers are generated |
 | `--eval-batch-size` | all trainers | 32, engine 16 (runners: 128) | generation batch |
 | `--eval-loss-batch-size` | ced_finetune, finetune | 32 | loss-pass chunk |
