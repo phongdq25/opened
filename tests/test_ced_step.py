@@ -1,0 +1,196 @@
+"""The grouped training step (ced_step.py) against the verbatim 4257d86 loss
+(tests/reference_ced_loss.py): same loss, same LoRA gradients."""
+import random
+
+import pytest
+import torch
+
+import reference_ced_loss as ref
+from conftest import EngineShim, ced_args, need
+from data_utils.lm_datasets import LMTrainDataset
+
+FEWREL = ("processed_data/fewrel_perm0/1/qwen/", "data/fewrel_perm0/streams.json")
+ACE = ("processed_data/ace_b10_perm0/1/qwen/", "data/ace_b10_perm0/streams.json")
+ACE_ORACLE = ("processed_data/ace_oracle_b10_perm0/1/qwen/", "data/ace_oracle_b10_perm0/streams.json")
+KD_TYPES = ["kd", "rkl", "sfkl", "srkl", "csd", "amid", "no"]
+
+
+def load(tokenizer, source, **overrides):
+    path, streams = source
+    args = ced_args(ced_streams_file=need(streams), ced_task_id=1, **overrides)
+    return args, LMTrainDataset(args, tokenizer, need(path), "train", -1, 1, random.Random(0))
+
+
+def with_args(args, **overrides):
+    return ced_args(**{**vars(args), **overrides})
+
+
+def pick_rows(ds, n_replay, n_new, n_pl=0, seed=0):
+    rnd = random.Random(seed)
+    replay = [i for i, f in enumerate(ds.replay_flags) if f]
+    pl = [i for i, f in enumerate(ds.replay_flags) if not f and ds.old_span_offsets[i]]
+    new = [i for i, f in enumerate(ds.replay_flags) if not f and not ds.old_span_offsets[i]]
+    rows = rnd.sample(replay, n_replay) + rnd.sample(pl, n_pl) + rnd.sample(new, n_new)
+    rnd.shuffle(rows)
+    return rows
+
+
+def collate(ds, rows, dynamic):
+    saved = ds.args.dynamic_pad_effective
+    ds.args.dynamic_pad_effective = dynamic
+    try:
+        return ds.collate([ds[i] for i in rows])
+    finally:
+        ds.args.dynamic_pad_effective = saved
+
+
+def add_hooks(model, captured, capture):
+    """The span-loss hooks ced_finetune.py registers on the decoder layers."""
+    def hook(module, inputs, output):
+        if module.training and capture["on"]:
+            captured.append(output[0] if isinstance(output, tuple) else output)
+    return [layer.register_forward_hook(hook) for layer in model.base_model.model.model.layers]
+
+
+def lora_grads(model):
+    return {n: p.grad.detach().clone() for n, p in model.named_parameters()
+            if p.requires_grad and p.grad is not None}
+
+
+def reference_loss(args, ds, rows, student, teacher, tokenizer, mutate=None):
+    """4257d86: each group collated on its own at full width and scored as one micro-batch."""
+    from ced_step import group_slices
+    engine, captured, capture = EngineShim(student), [], {"on": True}
+    handles = add_hooks(student, captured, capture)
+    try:
+        losses = []
+        for gs in group_slices(len(rows), args.loss_group_size):
+            mb, nmb, gen, _, _ = collate(ds, rows[gs], dynamic=False)
+            if mutate:
+                mutate(nmb, rows[gs])
+            captured.clear()
+            captured.append(None)
+            out = ref.reference_micro_step(args, tokenizer, engine, teacher, mb, nmb, gen, "cpu", 1,
+                                           None, {}, captured, capture)
+            losses.append(out["loss"])
+        return torch.stack(losses).mean()
+    finally:
+        for h in handles:
+            h.remove()
+
+
+def new_loss(args, ds, rows, student, teacher, dynamic=False, mutate=None):
+    from ced_step import ced_step_loss
+    engine, captured, capture = EngineShim(student), [None], {"on": True}
+    handles = add_hooks(student, captured, capture)
+    try:
+        mb, nmb, _, _, _ = collate(ds, rows, dynamic)
+        if mutate:
+            mutate(nmb, rows)
+        return ced_step_loss(args, engine, teacher, mb, nmb, captured, capture)
+    finally:
+        for h in handles:
+            h.remove()
+
+
+def check_equivalent(args, ds, rows, student, teacher, tokenizer, dynamic=False, mutate=None):
+    student.train()
+    student.zero_grad(set_to_none=True)
+    expected = reference_loss(args, ds, rows, student, teacher, tokenizer, mutate)
+    expected.backward()
+    expected_grads = lora_grads(student)
+    student.zero_grad(set_to_none=True)
+    got = new_loss(args, ds, rows, student, teacher, dynamic, mutate)
+    got.loss.backward()
+    got_grads = lora_grads(student)
+    torch.testing.assert_close(got.loss.detach(), expected.detach(), rtol=1e-5, atol=1e-7)
+    assert got_grads.keys() == expected_grads.keys()
+    for name, grad in expected_grads.items():
+        torch.testing.assert_close(got_grads[name], grad, rtol=1e-4, atol=1e-7, msg=name)
+    return got
+
+
+@pytest.fixture(scope="module")
+def fewrel(tokenizer):
+    return load(tokenizer, FEWREL)
+
+
+@pytest.fixture(scope="module")
+def ace(tokenizer):
+    return load(tokenizer, ACE, w_span_loss=2.0, type="sfkl")
+
+
+def test_group_slices_cover_the_batch_in_order():
+    from ced_step import group_slices
+    assert group_slices(8, 2) == [slice(0, 2), slice(2, 4), slice(4, 6), slice(6, 8)]
+    with pytest.raises(ValueError):
+        group_slices(8, 3)
+
+
+@pytest.mark.parametrize("kd_type", KD_TYPES)
+def test_token_kd_matches_the_reference(kd_type, fewrel, student, teacher, tokenizer):
+    args, ds = fewrel
+    check_equivalent(with_args(args, type=kd_type, amid_div_name="ab"), ds, pick_rows(ds, 3, 5),
+                     student, teacher, tokenizer)
+
+
+@pytest.mark.parametrize("group", [1, 4, 8])
+def test_any_group_size_matches_the_reference(group, fewrel, student, teacher, tokenizer):
+    args, ds = fewrel
+    check_equivalent(with_args(args, loss_group_size=group), ds, pick_rows(ds, 2, 6), student, teacher, tokenizer)
+
+
+def test_dynamic_padding_matches_the_reference(fewrel, student, teacher, tokenizer):
+    args, ds = fewrel
+    check_equivalent(args, ds, pick_rows(ds, 3, 5), student, teacher, tokenizer, dynamic=True)
+
+
+def test_kd_only_replay_mode_matches_the_reference(fewrel, student, teacher, tokenizer):
+    args, ds = fewrel
+    check_equivalent(with_args(args, ced_replay_mode="kd_only"), ds, pick_rows(ds, 3, 5), student, teacher,
+                     tokenizer)
+
+
+def test_lwf_matches_the_reference(fewrel, student, teacher, tokenizer):
+    args, ds = fewrel
+    check_equivalent(with_args(args, ced_kd_ratio_new=0.2), ds, pick_rows(ds, 3, 5), student, teacher, tokenizer)
+
+
+def test_a_group_without_labels_matches_the_reference(fewrel, student, teacher, tokenizer):
+    args, ds = fewrel
+    rows = pick_rows(ds, 3, 5)
+    blank = set(rows[2:4])                        # every row of the second group
+
+    def mutate(no_model_batch, batch_rows):
+        for k, row in enumerate(batch_rows):
+            if row in blank:
+                no_model_batch["label"][k] = -100
+
+    got = check_equivalent(args, ds, rows, student, teacher, tokenizer, mutate=mutate)
+    assert torch.isfinite(got.loss)
+
+
+@pytest.mark.parametrize("metric", ["cosine", "cka"])
+def test_span_loss_matches_the_reference(metric, ace, student, teacher, tokenizer):
+    args, ds = ace
+    check_equivalent(with_args(args, span_metric=metric), ds, pick_rows(ds, 3, 5), student, teacher, tokenizer)
+
+
+def test_pseudo_label_kd_scope_matches_the_reference(tokenizer, student, teacher):
+    # the oracle split keeps earlier types' events in new-task rows: rows shaped like pseudo-labelled ones
+    args, ds = load(tokenizer, ACE_ORACLE, w_span_loss=2.0, type="sfkl", ced_kd_scope="pl")
+    check_equivalent(args, ds, pick_rows(ds, 2, 3, n_pl=3), student, teacher, tokenizer)
+
+
+def test_grouped_ce_matches_finetune_cross_entropy(fewrel, student):
+    from ced_step import group_slices, grouped_ce_loss
+    args, ds = fewrel
+    rows = pick_rows(ds, 2, 6)
+    mb, nmb, _, _, _ = collate(ds, rows, dynamic=True)
+    got = grouped_ce_loss(student, mb, nmb["label"], 2)
+    loss_func, expected = torch.nn.CrossEntropyLoss(), []
+    for gs in group_slices(len(rows), 2):
+        gmb, gnmb, _, _, _ = collate(ds, rows[gs], dynamic=False)
+        logits = student(**gmb, use_cache=False).logits
+        expected.append(loss_func(logits.float().view(-1, logits.shape[-1]), gnmb["label"].view(-1)))
+    torch.testing.assert_close(got, torch.stack(expected).mean(), rtol=1e-5, atol=1e-7)
