@@ -373,7 +373,10 @@ done
 # Every GPU nvidia-smi lists, unless POOL_GPUS names some. SLOTS_PER_GPU runs share each card;
 # each slot is one run and gets its own torchrun port, 29500 + slot.
 POOL_GPUS=${POOL_GPUS:-$(nvidia-smi --query-gpu=index --format=csv,noheader 2>/dev/null | tr '\n' ' ')}
-SLOTS_PER_GPU=${SLOTS_PER_GPU:-1}
+SLOTS_PER_GPU=${SLOTS_PER_GPU:-3}
+export PHYS_BS=${PHYS_BS:-8}        # measured on 1x H200 NVL (tools/bench_gpu.sh)
+export USE_MPS=${USE_MPS:-1}
+export NEED_GPU_MB=${NEED_GPU_MB:-39833} NEED_LORA_MB=${NEED_LORA_MB:-18432}
 # The ids are nvidia-smi's (PCI order), and the runners both check memory with `nvidia-smi -i`
 # and train with CUDA_VISIBLE_DEVICES. CUDA's own default order is fastest-first, so make it
 # PCI order too, or on a mixed-GPU host the guard and the training would look at different cards.

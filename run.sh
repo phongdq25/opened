@@ -78,6 +78,7 @@ cd "$(dirname "$0")"
 export CLLORA_METHODS="inclora olora tree inflora epi migu gainlora_o gainlora_inf"
 export DIST_METHODS="kd rkl sfkl srkl csd distillm amid"   # labels dist_queue.sh knows
 export RESUME=${RESUME:-0}   # both CED queues read this
+export PHYS_BS=${PHYS_BS:-8}   # physical micro-batch target on H200 (tools/bench_gpu.sh)
 
 # What is still missing, dataset by dataset (checked 2026-09-26). One entry per dataset,
 # entries separated by ";", fields by ":" -> <dataset>:<perms>:<queue>.

@@ -159,6 +159,68 @@ Notes:
   completion marker before starting and skips finished work, so a re-run after any
   interruption just resumes.
 
+## Running on H200s (branch `perf/h200-throughput`)
+
+Same experiments, same objectives, much less wall-clock. What changed and how to control it:
+
+- **Physical vs logical batch.** Each runner keeps its micro-batch (`--bs`) as the unit the
+  loss is defined over. `PHYS_BS` (environment) sets how many rows go through the GPU at once.
+  The loss is still computed per `--bs` rows and averaged, and the accumulation shrinks so
+  rows per update stay 32. Runner scripts default to `PHYS_BS = --bs`. `project_commands.sh`
+  and `run.sh` set the H200 value below.
+- **Evaluation.** `run_ced_v2.sh` now generates answers once per task, for the test set after
+  the last update (`EVAL_GEN_MODE=final`; set `every` for the old per-epoch dev+test
+  evaluation, which `--select-best-dev 1` forces). Generation runs in batches of 128
+  (`EVAL_BS`).
+- **Padding.** Batches are padded to their longest row (`DYNAMIC_PAD=1`), except for runs
+  with a span loss (Ours and its ablations) or DistiLLM/AMiD.
+- **Packing.** `project_commands.sh` uses every GPU (`POOL_GPUS` to restrict) with
+  `SLOTS_PER_GPU` runs per card, a torchrun port per slot, and, on H200, optional CUDA MPS
+  (`USE_MPS`). CRE baselines run as one job per method after each order's shared task0.
+  `run.sh` accepts repeated GPU ids (`GPU_DIST_ALL=0,0,1,1`).
+- **Decoding (read this).** transformers 4.57 fills `GenerationConfig` fields left at their
+  library default from Qwen3's `generation_config.json`. As a result:
+  - the `--greedy 1` evaluation of task0, the distillation baselines and Ours **samples at
+    T=0.5, top_p 0.95**;
+  - SD and DistiLLM/AMiD sample at **T=0.6, top_p 0.95** instead of the requested 1.0/1.0;
+  - CL-LoRA evaluation is really greedy.
+
+  This branch keeps that behaviour so new numbers match existing ones. `STRICT_GEN=1`
+  (`--strict-generation`) makes every config literal: greedy evaluation and the requested
+  temperatures. That changes results, so decide it for the whole table.
+
+Measured on 1× H200 NVL (`bash tools/bench_gpu.sh h200`):
+
+| phase | phys | runs | mps | wall_s | s_per_update | peak_gib | mean_util |
+|---|---|---|---|---|---|---|---|
+| rkl | 2 | 1 | 0 | 159 | 2.67 | 13.7 | 21 |
+| ours | 2 | 1 | 0 | 704 | 49.42 | 31.9 | 24 |
+| cl | 2 | 1 | 0 | 284 | - | 15.8 | 40 |
+| rkl | 8 | 1 | 0 | 77 | 0.72 | 13.6 | 28 |
+| ours | 8 | 1 | 0 | 366 | 20.39 | 36.9 | 29 |
+| cl | 8 | 1 | 0 | 136 | - | 16.0 | 63 |
+| rkl | 16 | 1 | 0 | 83 | 0.41 | 21.1 | 35 |
+| ours | 16 | 1 | 0 | 290 | 13.66 | 67.5 | 34 |
+| cl | 16 | 1 | 0 | 142 | - | 24.1 | 69 |
+| rkl | 32 | 1 | 0 | 63 | 0.32 | 36.1 | 31 |
+| ours | 32 | 1 | 0 | 239 | 8.24 | 104.1 | 36 |
+| cl | 32 | 1 | 0 | 150 | - | 46.2 | 69 |
+| share | 16 | 1 | 0 | 84 | 0.46 | 21.1 | 35 |
+| share | 16 | 2 | 0 | 107 | 0.68 | 42.1 | 55 |
+| share | 16 | 3 | 0 | 142 | 0.96 | 63.2 | 67 |
+| share | 16 | 4 | 0 | 268 | 1.32 | 84.3 | 48 |
+| share | 16 | 1 | 1 | 83 | 0.41 | 21.1 | 36 |
+| share | 16 | 2 | 1 | 110 | 0.52 | 42.2 | 34 |
+| share | 16 | 3 | 1 | 112 | 0.68 | 63.3 | 58 |
+| share | 16 | 4 | 1 | 288 | 0.96 | 84.3 | 26 |
+
+The defaults come from these rows (the rule at the end of `tools/bench_gpu.sh`):
+`PHYS_BS=8`, because Ours peaks at 67.5 GiB at 16 and two Ours runs would not fit on one
+card; `SLOTS_PER_GPU=3` with `USE_MPS=1`, which finished the most runs per hour (three
+RKL runs in 112 s, one alone in 83 s). Matrices without Ours runs (the FewRel/TACRED
+baselines) can set `PHYS_BS=16`: RKL then takes 0.41 s per update instead of 0.72 s
+(measured for RKL and CL-LoRA; DistiLLM/AMiD at 16 are not measured).
+
 ## Results
 
 ```bash

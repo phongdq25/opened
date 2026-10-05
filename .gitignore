@@ -196,3 +196,4 @@ eval_outputs/
 /logs
 /logs2
 /.mps
+/bench
