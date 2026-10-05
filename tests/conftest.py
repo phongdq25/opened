@@ -1,5 +1,6 @@
 """Shared test fixtures. The tests run on the box that holds the data and the model, on
 CPU in fp32 (see docs/superpowers/plans/2026-10-05-h200-throughput.md)."""
+import json
 import os
 import sys
 from argparse import Namespace
@@ -110,3 +111,33 @@ def ced_args(**overrides):
     )
     base.update(overrides)
     return Namespace(**base)
+
+
+FAKE_VLLM = os.path.join(REPO, "tests", "fake_vllm.py")
+
+
+class FakeVLLM:
+    """What the fake_vllm fixture hands a test: the VLLM_PY to pass on, and the recorded calls."""
+
+    def __init__(self, python, log):
+        self.python, self.log = python, log
+
+    def calls(self):
+        if not os.path.exists(self.log):
+            return []
+        return [json.loads(line) for line in open(self.log)]
+
+
+@pytest.fixture
+def fake_vllm(monkeypatch, tmp_path):
+    """gen_backend runs tests/fake_vllm.py in place of tools/vllm_generate.py, through a VLLM_PY
+    that tells find_vllm_python() it holds vLLM 0.27.1."""
+    import gen_backend
+    python = tmp_path / "vllm_python"
+    python.write_text('#!/bin/bash\nif [ "$1" = "-c" ]; then echo "VLLM_VERSION 0.27.1"; exit 0; fi\n'
+                      f'exec {sys.executable} "$@"\n')
+    python.chmod(0o755)
+    monkeypatch.setattr(gen_backend, "VLLM_SCRIPT", FAKE_VLLM)
+    monkeypatch.setenv("VLLM_PY", str(python))
+    monkeypatch.setenv("FAKE_VLLM_LOG", str(tmp_path / "fake_vllm.log"))
+    return FakeVLLM(str(python), str(tmp_path / "fake_vllm.log"))
