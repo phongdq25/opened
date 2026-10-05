@@ -109,8 +109,10 @@ fi
 export MODEL_PATH=${MODEL_PATH:-Qwen/Qwen3-0.6B}
 
 # GPUs per family, comma-separated. Both modes use these; the single-dataset form can still
-# override them with arguments 3 and 4. The two lists must not overlap.
-# One queue per GPU, always: the memory guards in the runners are snapshots, not reservations.
+# override them with arguments 3 and 4. An id may repeat within a list (one sub-queue per entry,
+# sharing that card; each sub-queue gets its own torchrun port); the two lists must not share ids.
+# Repeat an id only when the card fits that many runs: the memory guards in the runners are
+# snapshots, not reservations.
 export GPU_DIST_ALL=${GPU_DIST_ALL:-0,1,2,3}
 export GPU_CLLORA_ALL=${GPU_CLLORA_ALL:-4,5,6,7}
 
@@ -177,13 +179,13 @@ run_dist_queue () {   # $1=family $2=dataset $3=gpus (comma list) $4..=perms
         else
             # Shared task0 first, on one GPU: every method starts from it, and parallel
             # sub-queues would each try to create it (the loser dies on the partial dir).
-            PERM=${p} GPU=${gpus[0]} PROTOCOL="$(protocol_of "${ds}")" DIST_METHODS="" \
+            PERM=${p} GPU=${gpus[0]} PROTOCOL="$(protocol_of "${ds}")" DIST_METHODS="" MASTER_PORT=29599 \
                 DATA_PREFIX="${ds}_b10_perm" bash scripts/qwen/ced/dist_queue.sh
             rc=$?
             if [ "${rc}" -eq 0 ]; then
                 pids=()
                 for i in "${!gpus[@]}"; do
-                    PERM=${p} GPU=${gpus[i]} PROTOCOL="$(protocol_of "${ds}")" \
+                    PERM=${p} GPU=${gpus[i]} PROTOCOL="$(protocol_of "${ds}")" MASTER_PORT=$((29600 + i)) \
                         DIST_METHODS="$(split_methods "${i}" "${#gpus[@]}" ${DIST_METHODS})" \
                         DATA_PREFIX="${ds}_b10_perm" bash scripts/qwen/ced/dist_queue.sh &
                     pids+=($!)

@@ -28,7 +28,10 @@
 #   VENV          venv to activate (default: /mnt/local/uvenvs/opened when none is active)
 #   PY / ENV_BIN  interpreter and env bin/ for the runners (default: derived from `python`)
 #   SKIP_INSTALL  1 = never touch dependencies
-#   POOL_GPUS     set in the script: "4 5 6 7", one slot per GPU id
+#   POOL_GPUS     GPU ids to use (default: every GPU nvidia-smi lists)
+#   SLOTS_PER_GPU runs sharing each GPU (default: set in section 3)
+#   PHYS_BS       physical micro-batch target for every runner (default: set in section 3)
+#   USE_MPS       1 = start CUDA MPS for runs sharing a GPU (default: set in section 3)
 #   PERMS         default "0 1 2 3 4"
 #   DS            dataset, default fewrel: ace maven rams geneva (CED), tacred fewrel (CRE)
 #   DATA_PREFIX   default <ds>_b10_perm (CED) or <ds>_perm (CRE), the names under data/
@@ -315,31 +318,30 @@ run_dir () {  # $1=config name  $2=sd  $3=perm
     if [ "$1" = "task0" ]; then echo "${R}/dist_shared_task0_perm$3_${PROTOCOL}_s${SEED}"; return; fi
     # memory-0 CL-LoRA: its own protocol tag, so it never collides with the buffer-10 runs
     if [ "$2" = "cl" ]; then echo "${R}/cllora_${1#l_}_perm$3_${DS}_b0_v2_s${SEED}"; return; fi
-    # CRE baselines: one job covers several runs; this is only a label for the pool log
-    if [ "$2" = "credist" ] || [ "$2" = "crecl" ]; then echo "${R}/<$1 ${DS} perm$3>"; return; fi
+    # CRE baselines: the runner names their run dirs; this is only a label for the pool log
+    case $2 in credist*|crecl*) echo "${R}/<$1 ${DS} perm$3>"; return ;; esac
     local tag=""; [ "$2" = "1" ] && tag="_sd"
     echo "${R}/ours_${VARIANT}${tag}_$1_perm$3_${PROTOCOL}_s${SEED}"
 }
 
-# Finished? One run dir with a .complete marker, except for the CRE baseline jobs, which are
-# done when every method's run is: the runners exit 0 even when a method failed.
+# Finished? One run dir with a .complete marker. CRE baselines are one job per method. The
+# shared CE task0 of an order counts as done while its merged model exists, or once every
+# distillation method of that order has finished (then nothing needs it any more).
 CRE_DIST_METHODS="rkl csd sfkl fkl srkl amid distillm"
 CRE_CLLORA_METHODS="tree inclora olora inflora epi migu gainlora_o gainlora_inf"
+cre_dist_done () {  # $1=method $2=perm. Either log layout counts (taskN/log.txt or taskN/<config>/log.txt),
+                    # as in the runner; compgen, not ls | grep, which pipefail fails when one is absent
+    compgen -G "${R}/cre_${DS}_$1_perm$2/task${LAST_TASK}/log.txt" > /dev/null \
+        || compgen -G "${R}/cre_${DS}_$1_perm$2/task${LAST_TASK}/*/log.txt" > /dev/null
+}
 job_done () {  # $1=config name  $2=sd  $3=perm
     local m
     case $2 in
-        credist)
-            for m in ${CRE_DIST_METHODS}; do
-                # either log layout counts (taskN/log.txt or taskN/<config>/log.txt), as in the
-                # runner; compgen, not ls | grep, which pipefail fails when one layout is absent
-                compgen -G "${R}/cre_${DS}_${m}_perm$3/task${LAST_TASK}/log.txt" > /dev/null \
-                    || compgen -G "${R}/cre_${DS}_${m}_perm$3/task${LAST_TASK}/*/log.txt" > /dev/null \
-                    || return 1
-            done ;;
-        crecl)
-            for m in ${CRE_CLLORA_METHODS}; do
-                [ -f "${R}/cllora_${m}_perm$3_${DS}_cre_s${SEED}/.complete" ] || return 1
-            done ;;
+        credist_t0)
+            [ -d "${R}/cre_${DS}_task0_perm$3/task0/merged" ] && return 0
+            for m in ${CRE_DIST_METHODS}; do cre_dist_done "${m}" "$3" || return 1; done ;;
+        credist:*) cre_dist_done "${2#credist:}" "$3" ;;
+        crecl:*)   [ -f "${R}/cllora_${2#crecl:}_perm$3_${DS}_cre_s${SEED}/.complete" ] ;;
         *) [ -f "$(run_dir "$1" "$2" "$3")/.complete" ] ;;
     esac
 }
@@ -355,23 +357,39 @@ if [ "${NEED_T0}" = "1" ]; then
     for p in ${PERMS}; do JOBS+=("task0|0|||${p}"); done  # ours' jobs wait on these; 5 fields like the rest
 fi
 for c in "${CONFIGS[@]}"; do
-    for p in ${PERMS}; do JOBS+=("${c}|${p}"); done
+    IFS='|' read -r cname csd _ _ <<< "${c}"
+    for p in ${PERMS}; do
+        case ${csd} in
+            credist)  # the order's shared CE task0 first, then one job per distillation method
+                JOBS+=("${cname}_t0|credist_t0|||${p}")
+                for m in ${CRE_DIST_METHODS}; do JOBS+=("${cname}_${m}|credist:${m}|||${p}"); done ;;
+            crecl)
+                for m in ${CRE_CLLORA_METHODS}; do JOBS+=("${cname}_${m}|crecl:${m}|||${p}"); done ;;
+            *) JOBS+=("${c}|${p}") ;;
+        esac
+    done
 done
 
-POOL_GPUS="4 5 6 7"
+# Every GPU nvidia-smi lists, unless POOL_GPUS names some. SLOTS_PER_GPU runs share each card;
+# each slot is one run and gets its own torchrun port, 29500 + slot.
+POOL_GPUS=${POOL_GPUS:-$(nvidia-smi --query-gpu=index --format=csv,noheader 2>/dev/null | tr '\n' ' ')}
+SLOTS_PER_GPU=${SLOTS_PER_GPU:-1}
 # The ids are nvidia-smi's (PCI order), and the runners both check memory with `nvidia-smi -i`
 # and train with CUDA_VISIBLE_DEVICES. CUDA's own default order is fastest-first, so make it
 # PCI order too, or on a mixed-GPU host the guard and the training would look at different cards.
 export CUDA_DEVICE_ORDER=PCI_BUS_ID
-GPUS=(${POOL_GPUS:-0})
+GPUS=()
+for g in ${POOL_GPUS:-0}; do
+    for _ in $(seq 1 "${SLOTS_PER_GPU}"); do GPUS+=("${g}"); done
+done
 step "3. train ${#JOBS[@]} jobs on gpus ${GPUS[*]}"
 mkdir -p logs
 POOL_LOG=logs/${DS}_matrix_pool.log
 echo "progress: ${POOL_LOG}   per-run logs: logs_ours_*.log and ${R}/<run>/task*/train.log"
 log () { echo "[pool $(date '+%F %T')] $*" | tee -a "${POOL_LOG}"; }
 
-launch () {  # $1=job $2=gpu -> starts it in the background
-    local name sd flags sd_args perm
+launch () {  # $1=job $2=gpu $3=slot -> starts it in the background; torchrun port 29500 + slot
+    local name sd flags sd_args perm port=$((29500 + $3))
     IFS='|' read -r name sd flags sd_args perm <<< "$1"
     # DRY still goes through pick/run_dir/T0 with real job strings: the field-count bug that
     # broke T0[${perm}] only showed up once the scheduler ran, so it has to run here too.
@@ -379,23 +397,25 @@ launch () {  # $1=job $2=gpu -> starts it in the background
     if [ "${name}" = "task0" ]; then
         # one task only, so a half-trained one is restarted rather than resumed
         rm -rf "$(run_dir task0 0 "${perm}")"
-        MASTER_PORT=$((29500 + $2)) bash scripts/qwen/ced/run_ced_v2.sh \
+        MASTER_PORT=${port} bash scripts/qwen/ced/run_ced_v2.sh \
             --run-name "$(basename "$(run_dir task0 0 "${perm}")")" --mode sft \
             --data-prefix "${DATA_PREFIX}" --perm "${perm}" \
             --rank 16 --alpha 64 --epochs 5 --lr 0.0002 --seed "${SEED}" \
             --bs 2 --acc 16 --greedy 1 --gpus "$2" --end-task 0
-    elif [ "${sd}" = "credist" ]; then
-        # its own torchrun port per GPU: several perms train side by side
-        MASTER_PORT=$((29500 + $2)) bash scripts/qwen/cre/run_cre_dist.sh "${DS}" "${perm}" "$2"
-    elif [ "${sd}" = "crecl" ]; then
-        bash scripts/qwen/cre/run_cre_cllora.sh "${DS}" "${perm}" "$2"
+    elif [ "${sd}" = "credist_t0" ]; then
+        T0_ONLY=1 KEEP_T0=1 MASTER_PORT=${port} bash scripts/qwen/cre/run_cre_dist.sh "${DS}" "${perm}" "$2"
+    elif [[ "${sd}" == credist:* ]]; then
+        METHODS="${sd#credist:}" KEEP_T0=1 NEED_T0=1 MASTER_PORT=${port} \
+            bash scripts/qwen/cre/run_cre_dist.sh "${DS}" "${perm}" "$2"
+    elif [[ "${sd}" == crecl:* ]]; then
+        METHODS="${sd#crecl:}" bash scripts/qwen/cre/run_cre_cllora.sh "${DS}" "${perm}" "$2"
     elif [ "${sd}" = "cl" ]; then
         bash scripts/qwen/ced/run_cllora.sh --method "${name#l_}" --data-root "data/${DS}_b0_perm${perm}" \
             --protocol "${DS}_b0_v2" --seed "${SEED}" --gpu "$2" --py "${PY}"
     else
         PERM="${perm}" GPU="$2" DATA_PREFIX="${DATA_PREFIX}" SEED="${SEED}" PROTOCOL="${PROTOCOL}" \
         OURS_VARIANT="${VARIANT}" OURS_SD="${sd}" SD_ARGS="${sd_args}" RUN_SUFFIX="_${name}" \
-        RESUME=0 MASTER_PORT=$((29500 + $2)) \
+        RESUME=0 MASTER_PORT=${port} \
             bash scripts/qwen/ced/ours_queue.sh ${flags}
     fi >> "${POOL_LOG}" 2>&1 &
 }
@@ -404,6 +424,11 @@ launch () {  # $1=job $2=gpu -> starts it in the background
 declare -A T0
 for p in ${PERMS}; do
     [ -f "$(run_dir task0 0 "${p}")/.complete" ] && T0[${p}]=done || T0[${p}]=pending
+done
+# the CRE distillation jobs' shared CE task0, same states
+declare -A T0CRE
+for p in ${PERMS}; do
+    job_done "" credist_t0 "${p}" && T0CRE[${p}]=done || T0CRE[${p}]=pending
 done
 
 pick () {  # sets JOB to the first startable job and drops it from PENDING; 1 if none
@@ -415,15 +440,25 @@ pick () {  # sets JOB to the first startable job and drops it from PENDING; 1 if
             log "skip   ${name}/perm${perm} (already complete)"
             unset 'PENDING[i]'; continue
         fi
-        case ${sd} in cl|credist|crecl) ;; *) [ "${name}" = "task0" ] || {  # baselines train their own task0
-            case ${T0[${perm}]} in
-                pending|running) continue ;;
-                failed) log "FAILED ${name}/perm${perm} (task0 of perm${perm} failed)"
-                        n_fail=$((n_fail + 1)); unset 'PENDING[i]'; continue ;;
-            esac
-        } ;; esac
+        case ${sd} in
+            cl|credist_t0|crecl:*) ;;
+            credist:*)  # waits for this order's shared CE task0
+                case ${T0CRE[${perm}]} in
+                    pending|running) continue ;;
+                    failed) log "FAILED ${name}/perm${perm} (CRE task0 of perm${perm} failed)"
+                            n_fail=$((n_fail + 1)); unset 'PENDING[i]'; continue ;;
+                esac ;;
+            *) [ "${name}" = "task0" ] || {  # ours' configs wait for ours' task0
+                case ${T0[${perm}]} in
+                    pending|running) continue ;;
+                    failed) log "FAILED ${name}/perm${perm} (task0 of perm${perm} failed)"
+                            n_fail=$((n_fail + 1)); unset 'PENDING[i]'; continue ;;
+                esac
+            } ;;
+        esac
         JOB=${job}; unset 'PENDING[i]'
         [ "${name}" = "task0" ] && T0[${perm}]=running
+        [ "${sd}" = "credist_t0" ] && T0CRE[${perm}]=running
         return 0
     done
     return 1
@@ -437,6 +472,13 @@ if [ "${DRY}" = "1" ]; then
     echo "DRY=1: no training, but the scheduler below still runs against stub jobs."
 fi
 
+# Optional CUDA MPS: lets the runs sharing a card run their kernels concurrently.
+MPS_STARTED=0
+if [ "${USE_MPS:-0}" = "1" ] && [ "${DRY}" != "1" ] && command -v nvidia-cuda-mps-control > /dev/null; then
+    export CUDA_MPS_PIPE_DIRECTORY=${PWD}/.mps/pipe CUDA_MPS_LOG_DIRECTORY=${PWD}/.mps/log
+    mkdir -p "${CUDA_MPS_PIPE_DIRECTORY}" "${CUDA_MPS_LOG_DIRECTORY}"
+    nvidia-cuda-mps-control -d && MPS_STARTED=1 && log "CUDA MPS started"
+fi
 PENDING=("${JOBS[@]}")
 declare -a SLOT_PID SLOT_JOB
 n_fail=0
@@ -450,15 +492,17 @@ while :; do
             if [ "${rc}" -eq 0 ] && { [ "${DRY}" = "1" ] || job_done "${name}" "${sd}" "${perm}"; }; then
                 log "done   ${name}/perm${perm} (gpu${GPUS[i]})"
                 [ "${name}" = "task0" ] && T0[${perm}]=done
+                [ "${sd}" = "credist_t0" ] && T0CRE[${perm}]=done
             else
                 log "FAILED ${name}/perm${perm} (gpu${GPUS[i]}, exit ${rc}), see ${POOL_LOG}"
                 n_fail=$((n_fail + 1))
                 [ "${name}" = "task0" ] && T0[${perm}]=failed
+                [ "${sd}" = "credist_t0" ] && T0CRE[${perm}]=failed
             fi
             SLOT_PID[i]=""
         fi
         pick || continue
-        launch "${JOB}" "${GPUS[i]}"
+        launch "${JOB}" "${GPUS[i]}" "${i}"
         SLOT_PID[i]=$!; SLOT_JOB[i]=${JOB}
         IFS='|' read -r name sd flags sd_args perm <<< "${JOB}"
         log "start  ${name}/perm${perm} (gpu${GPUS[i]})"
@@ -470,6 +514,16 @@ while :; do
         break
     fi
     sleep 20
+done
+
+[ "${MPS_STARTED}" = "1" ] && { echo quit | nvidia-cuda-mps-control || true; }
+# CRE orders whose distillation methods all finished no longer need their shared task0
+for p in ${PERMS}; do
+    d="${R}/cre_${DS}_task0_perm${p}/task0/merged"
+    [ -d "${d}" ] && [ "${DRY}" != "1" ] || continue
+    all=1
+    for m in ${CRE_DIST_METHODS}; do cre_dist_done "${m}" "${p}" || all=0; done
+    [ "${all}" = "1" ] && rm -rf "${d}"
 done
 
 step "4. collect logs and F1 files into logs/"
