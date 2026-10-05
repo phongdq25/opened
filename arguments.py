@@ -102,6 +102,9 @@ def add_data_args(parser: argparse.ArgumentParser):
                             "after the last update only, and a loss-only dev pass for the adaptive methods")
     group.add_argument("--eval-loss-batch-size", type=int, default=32,
                        help="rows per chunk of the evaluation loss pass (32 = the historical eval batch)")
+    group.add_argument("--dynamic-pad", action="store_true",
+                       help="pad each batch to its longest row (rounded up to 64) instead of --max-length; "
+                            "ignored with a span loss or --student-gen")
     
     group.add_argument("--only-prompt", action="store_true")
     return parser

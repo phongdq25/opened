@@ -285,10 +285,28 @@ class LMTrainDataset(Dataset):
 
         return model_data, no_model_data, gen_data
 
+    def batch_width(self, samples):
+        """Columns of the model inputs: --max-length, or with dynamic padding the longest row
+        of the batch rounded up to a multiple of 64 (at most --max-length). Rows are right
+        padded and attention is causal, so a row's logits do not depend on its padding."""
+        if not getattr(self.args, "dynamic_pad_effective", False):
+            return self.max_length
+        need = 1
+        for sample in samples:
+            ids = sample["input_ids"]
+            if self.args.model_type in ["qwen"] and 4294967295 in ids:
+                n = len(ids) - 1
+            elif 65535 in ids:
+                n = len(ids) - 1
+            else:
+                n = len(ids)
+            need = max(need, min(n, self.max_length) - 1)
+        return min(self.max_length, -(-need // 64) * 64)
+
     def collate(self, samples):
         bs = len(samples)
 
-        max_length = self.max_length
+        max_length = self.batch_width(samples)
         
         model_data = {
             "input_ids": torch.ones(bs, max_length, dtype=torch.long) * self.pad_id,
