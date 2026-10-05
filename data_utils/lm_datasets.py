@@ -21,6 +21,15 @@ def balanced_smoke_indices(replay_flags, limit):
         current_limit += min(len(current) - current_limit, remaining)
     selected = current[:current_limit] + replay[:replay_limit]
     return selected
+
+
+def resolve_num(num, available):
+    """Rows to use from a split: all of them for -1, else at most what the split holds.
+    DistributedMMapIndexedDataset loops forever on an index past its end
+    (distributed_indexed.py:201), so a cap larger than the split must never reach it."""
+    if num is None or num < 0:
+        return available
+    return min(num, available)
 import pickle
 import numpy as np
 from torch.utils.data import Dataset
@@ -70,10 +79,8 @@ class LMTrainDataset(Dataset):
                 f"CED smoke subset: {self.num} rows "
                 f"({sum(flags[index] for index in self.sample_indices)} replay)"
             )
-        elif num == -1:
-            self.num = len(self.lm_ctx)
         else:
-            self.num = num
+            self.num = resolve_num(num, len(self.lm_ctx))
 
         print_rank(f"Num LM instances: {len(self.lm_ctx)}")
 
