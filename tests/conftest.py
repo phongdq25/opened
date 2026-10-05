@@ -23,10 +23,12 @@ def need(path):
 
 
 @pytest.fixture(scope="session", autouse=True)
-def single_process_group():
-    """LMTrainDataset and evaluate() ask torch.distributed for the rank and world size."""
+def single_process_group(tmp_path_factory):
+    """LMTrainDataset and evaluate() ask torch.distributed for the rank and world size. A file
+    rendezvous needs no port, so the tests cannot collide with torchrun jobs or another test run."""
     if not dist.is_initialized():
-        dist.init_process_group("gloo", init_method="tcp://127.0.0.1:29591", rank=0, world_size=1)
+        store = tmp_path_factory.mktemp("dist") / "rendezvous"
+        dist.init_process_group("gloo", init_method=f"file://{store}", rank=0, world_size=1)
     yield
 
 
