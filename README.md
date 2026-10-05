@@ -221,6 +221,21 @@ RKL runs in 112 s, one alone in 83 s). Matrices without Ours runs (the FewRel/TA
 baselines) can set `PHYS_BS=16`: RKL then takes 0.41 s per update instead of 0.72 s
 (measured for RKL and CL-LoRA; DistiLLM/AMiD at 16 are not measured).
 
+End-to-end check, TACRED perm0, all 10 tasks, old code (`4257d86`) vs this branch, sharing one H200:
+
+| method | final-task trigger F1, old → new | wall-clock, old → new |
+|---|---|---|
+| RKL (distillation) | 63.79 → 65.56 | 3 h 24 min → 1 h 05 min (3.1×) |
+| IncLoRA (CL-LoRA) | 63.95 → 63.06 | 3 h 26 min → 1 h 10 min (2.9×) |
+
+The four runs ran at the same time on one H200 NVL, without MPS. The new runs used this
+branch's defaults: `PHYS_BS=8`; one test evaluation per task where the old RKL runner
+evaluated dev and test after each of its 5 epochs; CL-LoRA evaluation batches of 128
+instead of 16. The final-task test set has 1,240 triggers, so one point is about 12 of
+them. RKL's evaluation samples at T=0.5 in both trees (see Decoding above). IncLoRA's
+evaluation is greedy; its per-task F1 differs between the trees in both directions, by
+3.4 points at most (after task 1).
+
 ## Results
 
 ```bash
