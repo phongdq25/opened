@@ -36,6 +36,7 @@
 #   USE_MPS       1 = start CUDA MPS for runs sharing a GPU (default: by card size)
 #   GEN_BACKEND   hf | vllm: where evaluation answers and pseudo-labels come from (default: by card size)
 #   COMPILE_GEN   1 = compiled sampling inside training steps (default: by card size)
+#   GRAD_CKPT     1 = gradient checkpointing in the CED runners: less memory, same loss (default 0)
 #   PERMS         default "0 1 2 3 4"
 #   DS            dataset, default fewrel: ace maven rams geneva (CED), tacred fewrel (CRE)
 #   DATA_PREFIX   default <ds>_b10_perm (CED) or <ds>_perm (CRE), the names under data/
@@ -390,7 +391,7 @@ GPUS=()
 for _ in $(seq 1 "${SLOTS_PER_GPU}"); do
     for g in ${POOL_GPUS:-0}; do GPUS+=("${g}"); done   # round-robin: the first jobs spread over the cards
 done
-step "3. train ${#JOBS[@]} jobs on gpus ${GPUS[*]} (PHYS_BS=${PHYS_BS:-runner default} USE_MPS=${USE_MPS} GEN_BACKEND=${GEN_BACKEND} COMPILE_GEN=${COMPILE_GEN})"
+step "3. train ${#JOBS[@]} jobs on gpus ${GPUS[*]} (PHYS_BS=${PHYS_BS:-runner default} USE_MPS=${USE_MPS} GEN_BACKEND=${GEN_BACKEND} COMPILE_GEN=${COMPILE_GEN} GRAD_CKPT=${GRAD_CKPT:-0})"
 mkdir -p logs
 POOL_LOG=logs/${DS}_matrix_pool.log
 echo "progress: ${POOL_LOG}   per-run logs: logs_ours_*.log and ${R}/<run>/task*/train.log"

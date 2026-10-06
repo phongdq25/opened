@@ -210,6 +210,34 @@ def test_span_loss_matches_the_reference(metric, ace, student, teacher, tokenize
     check_equivalent(with_args(args, span_metric=metric), ds, pick_rows(ds, 3, 5), student, teacher, tokenizer)
 
 
+def test_gradient_checkpointing_keeps_the_span_loss_and_its_gradients(ace, student, teacher):
+    # --gradient-checkpointing recomputes each decoder layer in the backward pass, and the span-loss
+    # hooks capture those layers' outputs: a checkpointed Ours step must give the same loss and grads
+    from utils import enable_gradient_checkpointing
+    args, ds = ace
+    rows = pick_rows(ds, 3, 5)
+    args = with_args(args, batch_size=len(rows))
+    student.enable_input_require_grads()            # what utils.get_model does for every LoRA model
+    student.train()
+    student.zero_grad(set_to_none=True)
+    plain = new_loss(args, ds, rows, student, teacher)
+    plain.loss.backward()
+    plain_grads = lora_grads(student)
+    enable_gradient_checkpointing(student)
+    student.zero_grad(set_to_none=True)
+    calls = []
+    counter = student.base_model.model.model.layers[0].register_forward_hook(lambda *_: calls.append(1))
+    ckpt = new_loss(args, ds, rows, student, teacher)
+    ckpt.loss.backward()
+    counter.remove()
+    ckpt_grads = lora_grads(student)
+    assert len(calls) == 2                          # the forward, then its recomputation in the backward
+    torch.testing.assert_close(ckpt.loss.detach(), plain.loss.detach())
+    assert ckpt_grads.keys() == plain_grads.keys()
+    for name, grad in plain_grads.items():
+        torch.testing.assert_close(ckpt_grads[name], grad, msg=name)
+
+
 def test_pseudo_label_kd_scope_matches_the_reference(tokenizer, student, teacher):
     # the oracle split keeps earlier types' events in new-task rows: rows shaped like pseudo-labelled ones
     args, ds = load(tokenizer, ACE_ORACLE, w_span_loss=2.0, type="sfkl", ced_kd_scope="pl")

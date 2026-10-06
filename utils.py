@@ -117,6 +117,10 @@ def initialize(args):
 
 
 # Load and save model
+def enable_gradient_checkpointing(model):
+    model.gradient_checkpointing_enable()
+
+
 def get_model(args, device):
     config = AutoConfig.from_pretrained(args.model_path)
     
@@ -173,8 +177,8 @@ def get_model(args, device):
         # model = DDP(model)
         # NOTE: no need for DDP since deepspeed has done
     if args.gradient_checkpointing:
-        model.gradient_checkpointing_enable()
-    
+        enable_gradient_checkpointing(model)
+
     ed_time = time.time()
     
     print_rank(f"Model load time: {ed_time - st_time}s")

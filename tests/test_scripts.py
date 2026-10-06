@@ -180,6 +180,12 @@ def test_the_runners_hand_the_backend_on():
     assert '--gen-backend "${GEN_BACKEND:-hf}"' in open("scripts/qwen/ced/run_cllora.sh").read()
 
 
+def test_the_ced_runner_passes_gradient_checkpointing_on():
+    script = open("scripts/qwen/ced/run_ced_v2.sh").read()
+    assert "GRAD_CKPT=${GRAD_CKPT:-0}" in script and "--grad-ckpt) GRAD_CKPT=$2; shift 2;;" in script
+    assert '[ "${GRAD_CKPT}" = "1" ] && OPTS+=" --gradient-checkpointing"' in script
+
+
 def test_the_ced_runner_records_compiled_generation_in_its_manifest():
     script = open("scripts/qwen/ced/run_ced_v2.sh").read()
     manifest_line = next(line for line in script.splitlines() if line.startswith("MANIFEST_CONFIG="))

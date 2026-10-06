@@ -45,6 +45,7 @@ DYNAMIC_PAD=${DYNAMIC_PAD:-1}           # the trainer keeps fixed padding with a
 STRICT_GEN=${STRICT_GEN:-0}             # 1 = generation configs used as written (gen_config.py): changes results
 GEN_BACKEND=${GEN_BACKEND:-hf}         # vllm = answers and pseudo-labels from vLLM (gen_backend.py), same settings
 COMPILE_GEN=${COMPILE_GEN:-0}          # 1 = sample inside training steps with a static, compiled cache
+GRAD_CKPT=${GRAD_CKPT:-0}              # 1 = recompute layer activations in the backward: less memory, same loss
 RESUME=0
 
 while [[ $# -gt 0 ]]; do
@@ -106,6 +107,7 @@ while [[ $# -gt 0 ]]; do
         --strict-gen) STRICT_GEN=$2; shift 2;;
         --gen-backend) GEN_BACKEND=$2; shift 2;;
         --compile-gen) COMPILE_GEN=$2; shift 2;;
+        --grad-ckpt) GRAD_CKPT=$2; shift 2;;
         --resume) RESUME=1; shift;;
         *) echo "unknown flag $1"; exit 1;;
     esac
@@ -215,6 +217,7 @@ train_once () {  # $1=engine $2=init $3=data_dir $4=save $5=lr $6=epochs $7=extr
     [ "${STRICT_GEN}" = "1" ] && OPTS+=" --strict-generation"
     OPTS+=" --gen-backend ${GEN_BACKEND}"
     [ "${COMPILE_GEN}" = "1" ] && OPTS+=" --compile-generation"
+    [ "${GRAD_CKPT}" = "1" ] && OPTS+=" --gradient-checkpointing"
     OPTS+=" --warmup-iters 0 --warmup-ratio 0.1 --lr-decay-style wrmup_cosine --weight-decay 1e-2 --clip-grad 1.0"
     OPTS+=" --epochs $6 --max-length 768 --max-prompt-length 460"
     OPTS+=" --do-train --do-valid --eval-gen --save-interval -1 --eval-interval -1 --log-interval 20 --mid-log-num -1"

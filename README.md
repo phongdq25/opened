@@ -246,6 +246,20 @@ Same experiments, same objectives, much less wall-clock. What changed and how to
     default, so new Ours numbers stay comparable with eager runs.
   - DistiLLM/AMiD student generation stays uncompiled. It samples a different number of rows
     each step, every new batch size recompiles, and it measured slower.
+- **Gradient checkpointing (opt-in).** `GRAD_CKPT=1` (`--gradient-checkpointing`) recomputes
+  each decoder layer in the backward pass instead of keeping its activations. This is what lets
+  Ours run at a larger physical batch.
+  - One Ours step, span loss included, gives the same loss and LoRA gradients with and without
+    it (`tests/test_ced_step.py`).
+  - On the GPU, Ours runs do not repeat exactly: two runs with the same seed already differ by up
+    to 6% in the first logged loss. Two runs with checkpointing landed inside that spread.
+  - Measured on a shared H200 (`tools/bench_ours.sh`'s workload, ACE task 1) at PHYS_BS 16 with
+    `COMPILE_GEN=1`, the trainer peaked at 20.8 GB (67.5 GiB at 16 without checkpointing, in the
+    table below). It took 7.6-7.8 s per update after warm-up, against 21.7-23.2 s at PHYS_BS 8
+    eager.
+  - Baselines already fit at PHYS_BS 16 and only pay the recomputation, so leave it off for them.
+  - `bash tools/bench_ours.sh <tag>` on a free card compares packings for Ours runs: 3 runs at
+    PHYS_BS 8, 3 at 16 and 3 at 32 with checkpointing, and 1 at 32 without.
 
 Measured on 1× H200 NVL (`bash tools/bench_gpu.sh h200`):
 
