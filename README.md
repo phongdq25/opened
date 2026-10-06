@@ -178,6 +178,25 @@ Same experiments, same objectives, much less wall-clock. What changed and how to
   `SLOTS_PER_GPU` runs per card, a torchrun port per slot, and, on H200, optional CUDA MPS
   (`USE_MPS`). CRE baselines run as one job per method after each order's shared task0.
   `run.sh` accepts repeated GPU ids (`GPU_DIST_ALL=0,0,1,1`).
+- **Several launches on one host.** Launches started side by side in one tree share the cards,
+  each with its own `DS` (or `ONLY` / `PERMS`) and all with the same `POOL_GPUS` and
+  `SLOTS_PER_GPU`.
+  - Each job holds its slot's lock file in `SLOT_DIR` (default `.slots`) until it exits, so no
+    card carries more than `SLOTS_PER_GPU` runs, and each slot has its own torchrun port.
+  - The launches share one CUDA MPS daemon, and the last one to finish stops it.
+  - `ONLY` also takes single configs (`b_cllora`, `g1_full`).
+  - Nothing stops two launches from training the same runs, so give each its own.
+
+  For example, Ours on every dataset plus the TACRED baselines on a 4-GPU host:
+
+      mkdir -p logs
+      export POOL_GPUS="0 1 2 3" SKIP_INSTALL=1 PHYS_BS=16 NEED_GPU_MB=51200 NEED_LORA_MB=32768 \
+             OURS_PHYS_BS=32 OURS_GRAD_CKPT=1 COMPILE_GEN=1
+      for ds in ace maven rams geneva; do
+          DS=${ds} nohup bash project_commands.sh > logs/${ds}.out 2>&1 &
+      done
+      DS=tacred ONLY="g1 b" nohup bash project_commands.sh > logs/tacred.out 2>&1 &
+      DS=fewrel ONLY=g1 nohup bash project_commands.sh > logs/fewrel_ours.out 2>&1 &
 - **Decoding (read this).** transformers 4.57 fills `GenerationConfig` fields left at their
   library default from Qwen3's `generation_config.json`. As a result:
   - the `--greedy 1` evaluation of task0, the distillation baselines and Ours **samples at

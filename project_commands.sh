@@ -45,8 +45,17 @@
 #   DS            dataset, default fewrel: ace maven rams geneva (CED), tacred fewrel (CRE)
 #   DATA_PREFIX   default <ds>_b10_perm (CED) or <ds>_perm (CRE), the names under data/
 #   ONLY          groups to run, default "b" (baselines) on tacred/fewrel, "g1 m a c d l" on
-#                 ACE and "g1" on the other CED datasets
-#                 (bash owns $GROUPS, hence ONLY)
+#                 ACE and "g1" on the other CED datasets. A config name (b_cllora, g1_full)
+#                 picks that config alone. (bash owns $GROUPS, hence ONLY)
+#
+# Several launches can share one host: start them side by side in this tree with the same
+# POOL_GPUS and SLOTS_PER_GPU, each with its own DS (or ONLY / PERMS). Their jobs take the cards'
+# slots in turn (each job holds a lock file in SLOT_DIR, default .slots), so no card carries more
+# than SLOTS_PER_GPU runs, and they share one CUDA MPS daemon. Two launches must not select the
+# same runs: nothing would stop both from training them.
+#
+#   DS=ace bash project_commands.sh > logs/ace.out 2>&1 &
+#   DS=tacred ONLY="g1 b" bash project_commands.sh > logs/tacred.out 2>&1 &
 set -euo pipefail
 cd "$(dirname "$0")"
 source scripts/qwen/lib.sh
@@ -209,7 +218,9 @@ esac
 CONFIGS=()
 for c in "${CONFIGS_ALL[@]}"; do
     g=${c%%_*}
-    for want in ${ONLY}; do [ "${g}" = "${want}" ] && CONFIGS+=("${c}") && break; done
+    for want in ${ONLY}; do
+        { [ "${g}" = "${want}" ] || [ "${c%%|*}" = "${want}" ]; } && CONFIGS+=("${c}") && break
+    done
 done
 [ ${#CONFIGS[@]} -gt 0 ] || { echo "no configs selected by ONLY='${ONLY}'"; exit 1; }
 
@@ -390,8 +401,10 @@ for c in "${CONFIGS[@]}"; do
     done
 done
 
-# Every GPU nvidia-smi lists, unless POOL_GPUS names some. SLOTS_PER_GPU runs share each card;
-# each slot is one run and gets its own torchrun port, 29500 + slot.
+# Every GPU nvidia-smi lists, unless POOL_GPUS names some. SLOTS_PER_GPU runs share each card.
+# Slot k of GPU g is the lock file SLOT_DIR/gpu<g>_<k>.lock, held by the job running in it, and
+# torchrun port 29500 + 16g + k. So launches of this tree started side by side (each with its own
+# DS / ONLY / PERMS) share the cards' slots instead of each filling every card, on distinct ports.
 POOL_GPUS=${POOL_GPUS:-$( (nvidia-smi --query-gpu=index --format=csv,noheader 2>/dev/null || true) | tr '\n' ' ')}
 # SLOTS_PER_GPU, PHYS_BS, USE_MPS and the memory guards by card size: the values measured on
 # 1x H200 NVL on H200-class cards, one run per GPU with the runners' own settings on smaller
@@ -401,10 +414,13 @@ apply_card_defaults ${POOL_GPUS}
 # and train with CUDA_VISIBLE_DEVICES. CUDA's own default order is fastest-first, so make it
 # PCI order too, or on a mixed-GPU host the guard and the training would look at different cards.
 export CUDA_DEVICE_ORDER=PCI_BUS_ID
-GPUS=()
-for _ in $(seq 1 "${SLOTS_PER_GPU}"); do
-    for g in ${POOL_GPUS:-0}; do GPUS+=("${g}"); done   # round-robin: the first jobs spread over the cards
+GPUS=(); SLOT_K=(); PORTS=()
+for k in $(seq 0 $((SLOTS_PER_GPU - 1))); do
+    for g in ${POOL_GPUS:-0}; do        # round-robin: the first jobs spread over the cards
+        GPUS+=("${g}"); SLOT_K+=("${k}"); PORTS+=($((29500 + 16 * g + k)))
+    done
 done
+SLOT_DIR=${SLOT_DIR:-.slots}
 OURS_SETTINGS=""
 [ -n "${OURS_PHYS_BS:-}${OURS_GRAD_CKPT:-}" ] && OURS_SETTINGS="; Ours $(job_settings g1_full 1)"
 step "3. train ${#JOBS[@]} jobs on gpus ${GPUS[*]} (PHYS_BS=${PHYS_BS:-runner default} USE_MPS=${USE_MPS} GEN_BACKEND=${GEN_BACKEND} COMPILE_GEN=${COMPILE_GEN} GRAD_CKPT=${GRAD_CKPT:-0}${OURS_SETTINGS})"
@@ -413,12 +429,18 @@ POOL_LOG=logs/${DS}_matrix_pool.log
 echo "progress: ${POOL_LOG}   per-run logs: logs_ours_*.log and ${R}/<run>/task*/train.log"
 log () { echo "[pool $(date '+%F %T')] $*" | tee -a "${POOL_LOG}"; }
 
-launch () {  # $1=job $2=gpu $3=slot -> starts it in the background; torchrun port 29500 + slot
-    local name sd flags sd_args perm port=$((29500 + $3))
+launch () {  # $1=job $2=gpu $3=torchrun port -> starts it in the background
+    local name sd flags sd_args perm port=$3
     IFS='|' read -r name sd flags sd_args perm <<< "$1"
     # DRY still goes through pick/run_dir/T0 with real job strings: the field-count bug that
-    # broke T0[${perm}] only showed up once the scheduler ran, so it has to run here too.
-    if [ "${DRY}" = "1" ]; then ( : ) & return; fi
+    # broke T0[${perm}] only showed up once the scheduler ran, so it has to run here too. A stub
+    # job lasts DRY_JOB_S seconds; DRY_TRACE (tests) records when it held which slot.
+    if [ "${DRY}" = "1" ]; then
+        ( [ -z "${DRY_TRACE:-}" ] || echo "start $(date +%s.%N) gpu$2 port${port} ${DS}:${name}" >> "${DRY_TRACE}"
+          sleep "${DRY_JOB_S:-0}"
+          [ -z "${DRY_TRACE:-}" ] || echo "end $(date +%s.%N) gpu$2 port${port} ${DS}:${name}" >> "${DRY_TRACE}" ) &
+        return
+    fi
     if [ "${name}" = "task0" ]; then
         # one task only, so a half-trained one is restarted rather than resumed
         rm -rf "$(run_dir task0 0 "${perm}")"
@@ -498,16 +520,21 @@ if [ "${DRY}" = "1" ]; then
     echo "DRY=1: no training, but the scheduler below still runs against stub jobs."
 fi
 
-# Optional CUDA MPS: lets the runs sharing a card run their kernels concurrently.
+# Optional CUDA MPS: lets the runs sharing a card run their kernels concurrently. When another
+# launch of this tree runs, this one joins its daemon, and the last launch out stops it.
 MPS_STARTED=0
 if [ "${USE_MPS:-0}" = "1" ] && [ "${DRY}" != "1" ]; then
-    if mps_start "${PY}" "${GPUS[0]}"; then MPS_STARTED=1; log "CUDA MPS started"
+    if mps_start "${PY}" "${GPUS[0]}"; then
+        MPS_STARTED=1
+        if [ "${MPS_JOINED}" = "1" ]; then log "CUDA MPS joined (another launch of this tree started it)"
+        else log "CUDA MPS started"; fi
     else log "CUDA MPS is not usable on this host, running without it"; fi
 fi
 PENDING=("${JOBS[@]}")
 declare -a SLOT_PID SLOT_JOB
 n_fail=0
 while :; do
+    free_slot=0                 # 0 at the end of a round: other launches' jobs held every slot this one tried
     for i in "${!GPUS[@]}"; do
         pid=${SLOT_PID[i]:-}
         if [ -n "${pid}" ]; then
@@ -526,22 +553,28 @@ while :; do
             fi
             SLOT_PID[i]=""
         fi
-        pick || continue
-        launch "${JOB}" "${GPUS[i]}" "${i}"
+        [ ${#PENDING[@]} -gt 0 ] || continue
+        slot_lock "${SLOT_DIR}" "${GPUS[i]}" "${SLOT_K[i]}" || continue   # another launch's job runs there
+        free_slot=1
+        if ! pick; then slot_unlock; continue; fi
+        launch "${JOB}" "${GPUS[i]}" "${PORTS[i]}"
         SLOT_PID[i]=$!; SLOT_JOB[i]=${JOB}
+        slot_unlock                     # the job holds the slot now, until it exits
         IFS='|' read -r name sd flags sd_args perm <<< "${JOB}"
         log "start  ${name}/perm${perm} (gpu${GPUS[i]})"
     done
     busy=0
     for pid in ${SLOT_PID[@]+"${SLOT_PID[@]}"}; do [ -n "${pid}" ] && busy=1; done
-    if [ "${busy}" = "0" ]; then
+    # nothing running, and nothing left or a free slot none of the rest could take: those never will.
+    # With every slot held by other launches, wait for one instead.
+    if [ "${busy}" = "0" ] && { [ ${#PENDING[@]} -eq 0 ] || [ "${free_slot}" = "1" ]; }; then
         for job in ${PENDING[@]+"${PENDING[@]}"}; do log "FAILED ${job} (never startable)"; n_fail=$((n_fail + 1)); done
         break
     fi
-    sleep 20
+    sleep "${POOL_POLL_S:-20}"
 done
 
-[ "${MPS_STARTED}" = "1" ] && { echo quit | nvidia-cuda-mps-control || true; }
+[ "${MPS_STARTED}" = "1" ] && mps_stop
 # CRE orders whose distillation methods all finished no longer need their shared task0
 for p in ${PERMS}; do
     d="${R}/cre_${DS}_task0_perm${p}/task0/merged"

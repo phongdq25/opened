@@ -103,3 +103,42 @@ def test_without_ours_settings_ours_runs_take_the_launch_settings():
 def test_the_scheduler_starts_ours_runs_with_their_settings():
     # DRY=1 never reaches launch(), so pin the line that hands the settings to ours_queue.sh
     assert 'env $(job_settings "${name}" "${sd}") bash scripts/qwen/ced/ours_queue.sh' in open("project_commands.sh").read()
+
+
+def test_only_can_name_single_configs():
+    # ONLY takes groups (b) and single configs (b_cllora): here the CL-LoRA half of the baselines alone
+    _, plan = dry_plan(DS="fewrel", ONLY="b_cllora")
+    assert len(plan) == 8 and all(job.startswith("b_cllora_") for job in plan)
+
+
+def test_two_launches_share_the_slots_of_a_card(tmp_path):
+    # two launches, one card with 2 slots: never 2 jobs on one slot, never more than 2 on the card, and a
+    # launch whose slots the other one holds waits for them instead of failing its jobs
+    trace = tmp_path / "trace"
+    env = {k: v for k, v in os.environ.items() if k not in SETTINGS}
+    env.update(DRY="1", PERMS="0", POOL_GPUS="0", SLOTS_PER_GPU="2", SKIP_INSTALL="1", ONLY="b",
+               SLOT_DIR=str(tmp_path / "slots"), POOL_POLL_S="1", DRY_JOB_S="1", DRY_TRACE=str(trace))
+    for ds in ("fewrel", "tacred"):
+        if os.path.exists(f"logs/{ds}_matrix_pool.log"):
+            os.remove(f"logs/{ds}_matrix_pool.log")
+    launches = [subprocess.Popen(["bash", "project_commands.sh"], env={**env, "DS": ds},
+                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL) for ds in ("fewrel", "tacred")]
+    assert [launch.wait(timeout=900) for launch in launches] == [0, 0]
+    events = []
+    for line in trace.read_text().splitlines():
+        kind, t, _, port, job = line.split()
+        events.append((float(t), kind == "start", port, job))
+    events.sort()                                       # on a tie the end sorts first: its slot was free again
+    running, on_port = 0, {}
+    for _, start, port, job in events:
+        if start:
+            assert on_port.get(port) is None, f"{job} started on {port} while {on_port[port]} ran there"
+            on_port[port] = job
+            running += 1
+            assert running <= 2
+        else:
+            on_port[port] = None
+            running -= 1
+    assert sum(start for _, start, _, _ in events) == 32           # 16 jobs per launch, each run once
+    for ds in ("fewrel", "tacred"):
+        assert "FAILED" not in open(f"logs/{ds}_matrix_pool.log").read()

@@ -56,17 +56,74 @@ sys.exit(0 if vllm_supported(version) and vllm_sees_gpu(py) else 1)" > /dev/null
 # mps_start <python> <gpu id>: start a CUDA MPS daemon under ./.mps, then check that a CUDA
 # client can use it (a started daemon does not prove that, e.g. in some containers).
 #   0 = running, CUDA_MPS_* exported; 1 = not usable here, daemon stopped, environment clean.
+# Several launches of one tree share the daemon: one already running there is joined (MPS_JOINED=1)
+# instead of started. Each launch holds a shared lock on ./.mps/users from here to mps_stop (its jobs
+# inherit it), and mps_stop quits the daemon only when no other launch or job holds one.
 mps_start () {
     command -v nvidia-cuda-mps-control > /dev/null || return 1
     export CUDA_MPS_PIPE_DIRECTORY=${PWD}/.mps/pipe CUDA_MPS_LOG_DIRECTORY=${PWD}/.mps/log
     mkdir -p "${CUDA_MPS_PIPE_DIRECTORY}" "${CUDA_MPS_LOG_DIRECTORY}"
-    if nvidia-cuda-mps-control -d && CUDA_VISIBLE_DEVICES=$2 "$1" -c \
+    MPS_USERS_FD=
+    if command -v flock > /dev/null; then
+        exec {MPS_USERS_FD}>"${PWD}/.mps/users"
+        flock -s "${MPS_USERS_FD}"            # waits while a launch that is leaving quits the daemon
+    fi
+    # one launch at a time looks for the daemon and starts it, so launches started together start one
+    local start_fd= up=0 _
+    if command -v flock > /dev/null; then exec {start_fd}>"${PWD}/.mps/start"; flock -x "${start_fd}"; fi
+    MPS_JOINED=0
+    if mps_running; then
+        MPS_JOINED=1; up=1
+    elif nvidia-cuda-mps-control -d; then
+        for _ in $(seq 1 20); do mps_running && break; sleep 0.5; done     # answering before the next looks
+        up=1
+    fi
+    if [ -n "${start_fd}" ]; then exec {start_fd}>&-; fi
+    if [ "${up}" = "1" ] && CUDA_VISIBLE_DEVICES=$2 "$1" -c \
             "import torch; torch.zeros(1, device='cuda'); torch.cuda.synchronize()" > /dev/null 2>&1; then
         return 0
     fi
-    echo quit | nvidia-cuda-mps-control > /dev/null 2>&1 || true
+    mps_stop
     unset CUDA_MPS_PIPE_DIRECTORY CUDA_MPS_LOG_DIRECTORY
     return 1
+}
+
+mps_running () { echo get_server_list | nvidia-cuda-mps-control > /dev/null 2>&1; }
+
+# mps_stop: leave CUDA MPS, and quit its daemon unless another launch of this tree still uses it
+mps_stop () {
+    if [ -n "${MPS_USERS_FD:-}" ]; then
+        exec {MPS_USERS_FD}>&-
+        exec {MPS_USERS_FD}>"${PWD}/.mps/users"
+        if ! flock -n -x "${MPS_USERS_FD}"; then
+            exec {MPS_USERS_FD}>&-
+            MPS_USERS_FD=
+            return 0
+        fi
+    fi
+    echo quit | nvidia-cuda-mps-control > /dev/null 2>&1 || true
+    if [ -n "${MPS_USERS_FD:-}" ]; then exec {MPS_USERS_FD}>&-; fi
+    MPS_USERS_FD=
+}
+
+# slot_lock <dir> <gpu id> <slot>: take that slot of the GPU, on a new descriptor in SLOT_FD. The
+# scheduler then starts the job, which inherits it and so holds the slot until it exits, crash
+# included, and drops its own copy (slot_unlock). This is how launches sharing a tree share the
+# cards. 1 = a job of another launch holds it. Without flock every slot is free, as before.
+slot_lock () {
+    SLOT_FD=
+    command -v flock > /dev/null || return 0
+    mkdir -p "$1"
+    exec {SLOT_FD}>"$1/gpu$2_$3.lock"
+    flock -n "${SLOT_FD}" && return 0
+    exec {SLOT_FD}>&-
+    SLOT_FD=
+    return 1
+}
+
+slot_unlock () {
+    if [ -n "${SLOT_FD:-}" ]; then exec {SLOT_FD}>&-; fi
+    SLOT_FD=
 }
 
 # vllm_check <python>: with GEN_BACKEND=vllm, stop unless gen_backend.find_vllm_python() finds a vLLM

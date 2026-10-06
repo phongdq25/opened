@@ -119,7 +119,11 @@ def test_apply_card_defaults_fills_only_what_the_caller_left_unset(tmp_path, mib
     assert out.stdout.strip() == expected, out.stderr
 
 
-MPS_CONTROL = 'if [ $# -eq 0 ]; then echo "stdin:$(cat)" >> "${MPS_LOG}"; else echo "args:$*" >> "${MPS_LOG}"; fi'
+# a daemon per pipe directory, as the real one: -d refuses a second one, get_server_list fails without one
+MPS_CONTROL = '''up="${MPS_LOG}.up"
+if [ $# -gt 0 ]; then echo "args:$*" >> "${MPS_LOG}"; sleep 0.5; [ -e "${up}" ] && exit 1; touch "${up}"; exit 0; fi
+cmd=$(cat); echo "stdin:${cmd}" >> "${MPS_LOG}"
+case ${cmd} in get_server_list) [ -e "${up}" ] ;; quit) rm -f "${up}" ;; esac'''
 
 
 @pytest.mark.parametrize("client_rc", [0, 1])
@@ -137,6 +141,72 @@ def test_mps_start_keeps_the_daemon_only_when_a_cuda_client_can_use_it(tmp_path,
     else:
         assert out.stdout.strip() == "rc=1 pipe=unset" and "stdin:quit" in calls
 
+
+
+def launch_shell(tmp_path, bin_dir, log, name):
+    """A bash 'launch' that joins CUDA MPS, says so, and leaves it once tmp_path/<name>.stop appears."""
+    stop = tmp_path / f"{name}.stop"
+    return subprocess.Popen(
+        ["bash", "-c", f'source {os.path.abspath(LIB)}; cd {tmp_path}; mps_start {bin_dir}/fakepy 0 && echo joined || echo failed; '
+                       f'while [ ! -e {stop} ]; do sleep 0.1; done; mps_stop; echo left'],
+        env={**os.environ, "PATH": f"{bin_dir}:{os.environ['PATH']}", "MPS_LOG": str(log)},
+        stdout=subprocess.PIPE, text=True)
+
+
+def test_launches_share_one_mps_daemon_and_the_last_one_out_stops_it(tmp_path):
+    bin_dir = fake_bin(tmp_path, **{"nvidia-cuda-mps-control": MPS_CONTROL, "fakepy": "exit 0"})
+    log = tmp_path / "mps.log"
+    first = launch_shell(tmp_path, bin_dir, log, "first")
+    second = None
+    try:
+        assert first.stdout.readline().strip() == "joined"
+        second = launch_shell(tmp_path, bin_dir, log, "second")
+        assert second.stdout.readline().strip() == "joined"
+        assert log.read_text().count("args:-d") == 1              # the second joined the first one's daemon
+        (tmp_path / "first.stop").touch()
+        assert first.stdout.readline().strip() == "left" and first.wait(timeout=30) == 0
+        assert "stdin:quit" not in log.read_text()                 # the second still runs jobs on it
+        (tmp_path / "second.stop").touch()
+        assert second.stdout.readline().strip() == "left" and second.wait(timeout=30) == 0
+        assert log.read_text().count("stdin:quit") == 1
+    finally:
+        for launch in (first, second):
+            if launch is not None:
+                launch.kill()
+
+
+def test_launches_starting_together_start_one_mps_daemon_and_all_join_it(tmp_path):
+    # the fake daemon takes 0.5 s to come up: a launch must not miss it and start a second one
+    bin_dir = fake_bin(tmp_path, **{"nvidia-cuda-mps-control": MPS_CONTROL, "fakepy": "exit 0"})
+    log = tmp_path / "mps.log"
+    launches = [launch_shell(tmp_path, bin_dir, log, name) for name in ("a", "b", "c")]
+    try:
+        assert [launch.stdout.readline().strip() for launch in launches] == ["joined"] * 3
+        assert log.read_text().count("args:-d") == 1
+        for name, launch in zip(("a", "b", "c"), launches):
+            (tmp_path / f"{name}.stop").touch()
+            assert launch.stdout.readline().strip() == "left" and launch.wait(timeout=30) == 0
+        assert log.read_text().count("stdin:quit") == 1
+    finally:
+        for launch in launches:
+            launch.kill()
+
+
+def test_a_slot_held_by_a_running_job_is_not_taken_until_the_job_exits(tmp_path):
+    slots = tmp_path / "slots"
+    lock = lambda gpu, k: bash(f"slot_lock {slots} {gpu} {k}").returncode
+    # what the scheduler does: lock the slot, start the job (it inherits the lock), close its own copy
+    holder = subprocess.Popen(["bash", "-c", f"source {LIB}; slot_lock {slots} 0 1 || exit 9; "
+                               "sleep 60 & job=$!; slot_unlock; echo $job; wait $job"],
+                              stdout=subprocess.PIPE, text=True)
+    job = int(holder.stdout.readline())
+    try:
+        assert lock(0, 1) == 1                                     # held by the job, not by its launch
+        assert lock(0, 2) == 0 and lock(1, 1) == 0                 # other slots stay free
+    finally:
+        os.kill(job, 15)
+        holder.wait(timeout=30)
+    assert lock(0, 1) == 0
 
 def test_run_sh_takes_its_defaults_from_the_cards():
     assert "apply_card_defaults" in open("run.sh").read()
