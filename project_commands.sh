@@ -425,7 +425,7 @@ OURS_SETTINGS=""
 [ -n "${OURS_PHYS_BS:-}${OURS_GRAD_CKPT:-}" ] && OURS_SETTINGS="; Ours $(job_settings g1_full 1)"
 step "3. train ${#JOBS[@]} jobs on gpus ${GPUS[*]} (PHYS_BS=${PHYS_BS:-runner default} USE_MPS=${USE_MPS} GEN_BACKEND=${GEN_BACKEND} COMPILE_GEN=${COMPILE_GEN} GRAD_CKPT=${GRAD_CKPT:-0}${OURS_SETTINGS})"
 mkdir -p logs
-POOL_LOG=logs/${DS}_matrix_pool.log
+POOL_LOG=${POOL_LOG:-logs/${DS}_matrix_pool.log}
 echo "progress: ${POOL_LOG}   per-run logs: logs_ours_*.log and ${R}/<run>/task*/train.log"
 log () { echo "[pool $(date '+%F %T')] $*" | tee -a "${POOL_LOG}"; }
 
@@ -533,6 +533,7 @@ fi
 PENDING=("${JOBS[@]}")
 declare -a SLOT_PID SLOT_JOB
 n_fail=0
+last_wait_log=0
 while :; do
     free_slot=0                 # 0 at the end of a round: other launches' jobs held every slot this one tried
     for i in "${!GPUS[@]}"; do
@@ -570,6 +571,11 @@ while :; do
     if [ "${busy}" = "0" ] && { [ ${#PENDING[@]} -eq 0 ] || [ "${free_slot}" = "1" ]; }; then
         for job in ${PENDING[@]+"${PENDING[@]}"}; do log "FAILED ${job} (never startable)"; n_fail=$((n_fail + 1)); done
         break
+    fi
+    # idle because other launches' jobs hold every slot: say so when it starts, then every WAIT_LOG_S
+    if [ "${busy}" = "0" ] && [ $(( $(date +%s) - last_wait_log )) -ge "${WAIT_LOG_S:-1800}" ]; then
+        log "waiting for a slot: ${#PENDING[@]} jobs left, and other launches' jobs hold every slot (${SLOT_DIR})"
+        last_wait_log=$(date +%s)
     fi
     sleep "${POOL_POLL_S:-20}"
 done

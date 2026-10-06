@@ -184,6 +184,8 @@ Same experiments, same objectives, much less wall-clock. What changed and how to
   - Each job holds its slot's lock file in `SLOT_DIR` (default `.slots`) until it exits, so no
     card carries more than `SLOTS_PER_GPU` runs, and each slot has its own torchrun port.
   - The launches share one CUDA MPS daemon, and the last one to finish stops it.
+  - A launch with nothing to run because other launches hold every slot says so in its pool log,
+    every 30 minutes.
   - `ONLY` also takes single configs (`b_cllora`, `g1_full`).
   - Nothing stops two launches from training the same runs, so give each its own.
 
@@ -284,7 +286,9 @@ Same experiments, same objectives, much less wall-clock. What changed and how to
     included), and a run with several micro-steps per update logs half its first loss. A physical
     batch that holds a whole update would apply that update; `ced_step.first_global_step` makes it
     count like the run it splits, so PHYS_BS 32 trains, logs, saves and evaluates exactly as 8 and
-    16 do (`tests/test_ced_step.py`).
+    16 do (`tests/test_ced_step.py`) on any split of at least 64 rows. Inside an update the step
+    count still differs by one, which only knobs no table uses read (`--ced-sd-mix random`,
+    `--ced-sd-warmup`).
   - Baselines already fit at PHYS_BS 16 and only pay the recomputation, so leave it off for them.
     `OURS_PHYS_BS=32 OURS_GRAD_CKPT=1` gives Ours and its ablations these settings while the
     baselines of the same launch keep `PHYS_BS` and `GRAD_CKPT`.

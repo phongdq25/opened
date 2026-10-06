@@ -7,15 +7,14 @@ SETTINGS = ("POOL_GPUS", "SLOTS_PER_GPU", "PHYS_BS", "USE_MPS", "NEED_GPU_MB", "
             "COMPILE_GEN", "GRAD_CKPT", "OURS_PHYS_BS", "OURS_GRAD_CKPT", "ONLY")
 
 
-def test_dry_run_schedules_cre_methods_after_their_shared_task0():
-    log = "logs/fewrel_matrix_pool.log"
-    if os.path.exists(log):
-        os.remove(log)
+def test_dry_run_schedules_cre_methods_after_their_shared_task0(tmp_path):
+    # its own pool log and slots, so a launch running in this tree keeps its log and its cards
+    log = tmp_path / "pool.log"
     env = {**os.environ, "DRY": "1", "DS": "fewrel", "PERMS": "0", "POOL_GPUS": "0", "SLOTS_PER_GPU": "3",
-           "SKIP_INSTALL": "1"}
+           "SKIP_INSTALL": "1", "POOL_LOG": str(log), "SLOT_DIR": str(tmp_path / "slots")}
     out = subprocess.run(["bash", "project_commands.sh"], env=env, capture_output=True, text=True, timeout=900)
     assert out.returncode == 0, out.stdout[-3000:] + out.stderr[-3000:]
-    lines = open(log).read().splitlines()
+    lines = log.read_text().splitlines()
     assert not any("FAILED" in line for line in lines)
     done = [line for line in lines if " done " in line]
     assert len(done) == 16                                   # 1 shared task0 + 7 distillation + 8 CL-LoRA
@@ -118,10 +117,7 @@ def test_two_launches_share_the_slots_of_a_card(tmp_path):
     env = {k: v for k, v in os.environ.items() if k not in SETTINGS}
     env.update(DRY="1", PERMS="0", POOL_GPUS="0", SLOTS_PER_GPU="2", SKIP_INSTALL="1", ONLY="b",
                SLOT_DIR=str(tmp_path / "slots"), POOL_POLL_S="1", DRY_JOB_S="1", DRY_TRACE=str(trace))
-    for ds in ("fewrel", "tacred"):
-        if os.path.exists(f"logs/{ds}_matrix_pool.log"):
-            os.remove(f"logs/{ds}_matrix_pool.log")
-    launches = [subprocess.Popen(["bash", "project_commands.sh"], env={**env, "DS": ds},
+    launches = [subprocess.Popen(["bash", "project_commands.sh"], env={**env, "DS": ds, "POOL_LOG": str(tmp_path / ds)},
                                  stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL) for ds in ("fewrel", "tacred")]
     assert [launch.wait(timeout=900) for launch in launches] == [0, 0]
     events = []
@@ -141,4 +137,34 @@ def test_two_launches_share_the_slots_of_a_card(tmp_path):
             running -= 1
     assert sum(start for _, start, _, _ in events) == 32           # 16 jobs per launch, each run once
     for ds in ("fewrel", "tacred"):
-        assert "FAILED" not in open(f"logs/{ds}_matrix_pool.log").read()
+        assert "FAILED" not in (tmp_path / ds).read_text()
+
+
+def test_a_launch_waiting_for_slots_other_launches_hold_says_so(tmp_path):
+    # one slot, held by the first launch's 4 s jobs: the second launch has nothing running and says why
+    env = {k: v for k, v in os.environ.items() if k not in SETTINGS}
+    env.update(DRY="1", PERMS="0", POOL_GPUS="0", SLOTS_PER_GPU="1", SKIP_INSTALL="1", ONLY="b_dist",
+               SLOT_DIR=str(tmp_path / "slots"), POOL_POLL_S="1", WAIT_LOG_S="0")
+    first_log, second_log = tmp_path / "first", tmp_path / "second"
+    start = lambda ds, log, job_s: subprocess.Popen(
+        ["bash", "project_commands.sh"], env={**env, "DS": ds, "POOL_LOG": str(log), "DRY_JOB_S": job_s},
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+    launches = [start("fewrel", first_log, "4")]
+    try:
+        assert wait_for(lambda: " start " in (first_log.read_text() if first_log.exists() else ""))
+        launches.append(start("tacred", second_log, "0"))
+        assert wait_for(lambda: "waiting for a slot" in (second_log.read_text() if second_log.exists() else ""))
+    finally:
+        for launch in launches:
+            os.killpg(launch.pid, signal.SIGKILL)
+            launch.wait()
+
+
+def wait_for(condition, timeout=120):
+    import time
+    end = time.time() + timeout
+    while time.time() < end:
+        if condition():
+            return True
+        time.sleep(0.5)
+    return False

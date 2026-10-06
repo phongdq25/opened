@@ -64,17 +64,23 @@ mps_start () {
     export CUDA_MPS_PIPE_DIRECTORY=${PWD}/.mps/pipe CUDA_MPS_LOG_DIRECTORY=${PWD}/.mps/log
     mkdir -p "${CUDA_MPS_PIPE_DIRECTORY}" "${CUDA_MPS_LOG_DIRECTORY}"
     MPS_USERS_FD=
-    if command -v flock > /dev/null; then
-        exec {MPS_USERS_FD}>"${PWD}/.mps/users"
-        flock -s "${MPS_USERS_FD}"            # waits while a launch that is leaving quits the daemon
-    fi
-    # one launch at a time looks for the daemon and starts it, so launches started together start one
-    local start_fd= up=0 _
-    if command -v flock > /dev/null; then exec {start_fd}>"${PWD}/.mps/start"; flock -x "${start_fd}"; fi
     MPS_JOINED=0
+    local start_fd= up=0 _
+    if command -v flock > /dev/null; then
+        # The shared lock waits while a launch that is leaving quits the daemon; the start lock lets
+        # one launch at a time look for the daemon and start it, so launches started together start
+        # one. Both take seconds: after five minutes something is stuck, so run without MPS.
+        exec {MPS_USERS_FD}>"${PWD}/.mps/users" {start_fd}>"${PWD}/.mps/start"
+        if ! flock -w 300 -s "${MPS_USERS_FD}" || ! flock -w 300 -x "${start_fd}"; then
+            exec {start_fd}>&- {MPS_USERS_FD}>&-
+            MPS_USERS_FD=
+            unset CUDA_MPS_PIPE_DIRECTORY CUDA_MPS_LOG_DIRECTORY
+            return 1
+        fi
+    fi
     if mps_running; then
         MPS_JOINED=1; up=1
-    elif nvidia-cuda-mps-control -d; then
+    elif mps_daemon_start; then
         for _ in $(seq 1 20); do mps_running && break; sleep 0.5; done     # answering before the next looks
         up=1
     fi
@@ -90,6 +96,15 @@ mps_start () {
 
 mps_running () { echo get_server_list | nvidia-cuda-mps-control > /dev/null 2>&1; }
 
+# The daemon outlives the launch that starts it, so it must not keep that launch's lock descriptors:
+# holding the start lock it would stop every later launch at mps_start, and holding a shared users
+# lock it would keep mps_stop from ever quitting it.
+mps_daemon_start () {
+    ( if [ -n "${start_fd:-}" ]; then exec {start_fd}>&-; fi
+      if [ -n "${MPS_USERS_FD:-}" ]; then exec {MPS_USERS_FD}>&-; fi
+      exec nvidia-cuda-mps-control -d )
+}
+
 # mps_stop: leave CUDA MPS, and quit its daemon unless another launch of this tree still uses it
 mps_stop () {
     if [ -n "${MPS_USERS_FD:-}" ]; then
@@ -102,6 +117,8 @@ mps_stop () {
         fi
     fi
     echo quit | nvidia-cuda-mps-control > /dev/null 2>&1 || true
+    local _
+    for _ in $(seq 1 60); do mps_running || break; sleep 0.5; done   # gone before a starting launch looks
     if [ -n "${MPS_USERS_FD:-}" ]; then exec {MPS_USERS_FD}>&-; fi
     MPS_USERS_FD=
 }

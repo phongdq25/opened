@@ -119,11 +119,32 @@ def test_apply_card_defaults_fills_only_what_the_caller_left_unset(tmp_path, mib
     assert out.stdout.strip() == expected, out.stderr
 
 
-# a daemon per pipe directory, as the real one: -d refuses a second one, get_server_list fails without one
+# A daemon per pipe directory, as the real one: -d takes 0.5 s and refuses a second one, the daemon
+# outlives the call with whatever descriptors it inherited, get_server_list fails without one, quit ends it.
 MPS_CONTROL = '''up="${MPS_LOG}.up"
-if [ $# -gt 0 ]; then echo "args:$*" >> "${MPS_LOG}"; sleep 0.5; [ -e "${up}" ] && exit 1; touch "${up}"; exit 0; fi
+if [ $# -gt 0 ]; then
+    echo "args:$*" >> "${MPS_LOG}"; sleep 0.5; [ -e "${up}" ] && exit 1; touch "${up}"
+    sleep 600 > /dev/null 2>&1 < /dev/null &
+    echo $! > "${MPS_LOG}.pid"; exit 0
+fi
 cmd=$(cat); echo "stdin:${cmd}" >> "${MPS_LOG}"
-case ${cmd} in get_server_list) [ -e "${up}" ] ;; quit) rm -f "${up}" ;; esac'''
+case ${cmd} in
+    get_server_list) [ -e "${up}" ] ;;
+    quit) rm -f "${up}"; kill "$(cat "${MPS_LOG}.pid")" 2> /dev/null; true ;;
+esac'''
+
+
+def stop_fake_daemon(log):
+    pid = f"{log}.pid"
+    if os.path.exists(pid):
+        subprocess.run(["kill", open(pid).read().strip()], capture_output=True)
+
+
+def line(proc, timeout=20):
+    """The next line proc prints, or None when it prints nothing for timeout seconds."""
+    import select
+    ready, _, _ = select.select([proc.stdout], [], [], timeout)
+    return proc.stdout.readline().strip() if ready else None
 
 
 @pytest.mark.parametrize("client_rc", [0, 1])
@@ -134,6 +155,7 @@ def test_mps_start_keeps_the_daemon_only_when_a_cuda_client_can_use_it(tmp_path,
                           'echo "rc=$? pipe=${CUDA_MPS_PIPE_DIRECTORY:-unset}"'],
                          env={**os.environ, "PATH": f"{bin_dir}:{os.environ['PATH']}", "MPS_LOG": str(log)},
                          capture_output=True, text=True)
+    stop_fake_daemon(log)
     calls = log.read_text()
     assert "args:-d" in calls
     if client_rc == 0:
@@ -159,20 +181,21 @@ def test_launches_share_one_mps_daemon_and_the_last_one_out_stops_it(tmp_path):
     first = launch_shell(tmp_path, bin_dir, log, "first")
     second = None
     try:
-        assert first.stdout.readline().strip() == "joined"
+        assert line(first) == "joined"
         second = launch_shell(tmp_path, bin_dir, log, "second")
-        assert second.stdout.readline().strip() == "joined"
+        assert line(second) == "joined"
         assert log.read_text().count("args:-d") == 1              # the second joined the first one's daemon
         (tmp_path / "first.stop").touch()
-        assert first.stdout.readline().strip() == "left" and first.wait(timeout=30) == 0
+        assert line(first) == "left" and first.wait(timeout=30) == 0
         assert "stdin:quit" not in log.read_text()                 # the second still runs jobs on it
         (tmp_path / "second.stop").touch()
-        assert second.stdout.readline().strip() == "left" and second.wait(timeout=30) == 0
-        assert log.read_text().count("stdin:quit") == 1
+        assert line(second) == "left" and second.wait(timeout=30) == 0
+        assert log.read_text().count("stdin:quit") == 1            # the daemon held no launch's lock
     finally:
         for launch in (first, second):
             if launch is not None:
                 launch.kill()
+        stop_fake_daemon(log)
 
 
 def test_launches_starting_together_start_one_mps_daemon_and_all_join_it(tmp_path):
@@ -181,15 +204,17 @@ def test_launches_starting_together_start_one_mps_daemon_and_all_join_it(tmp_pat
     log = tmp_path / "mps.log"
     launches = [launch_shell(tmp_path, bin_dir, log, name) for name in ("a", "b", "c")]
     try:
-        assert [launch.stdout.readline().strip() for launch in launches] == ["joined"] * 3
+        # the daemon outlives the launch that started it: it must not keep that launch's start lock
+        assert [line(launch) for launch in launches] == ["joined"] * 3
         assert log.read_text().count("args:-d") == 1
         for name, launch in zip(("a", "b", "c"), launches):
             (tmp_path / f"{name}.stop").touch()
-            assert launch.stdout.readline().strip() == "left" and launch.wait(timeout=30) == 0
+            assert line(launch) == "left" and launch.wait(timeout=30) == 0
         assert log.read_text().count("stdin:quit") == 1
     finally:
         for launch in launches:
             launch.kill()
+        stop_fake_daemon(log)
 
 
 def test_a_slot_held_by_a_running_job_is_not_taken_until_the_job_exits(tmp_path):
