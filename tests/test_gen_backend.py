@@ -153,6 +153,22 @@ def test_an_untested_vllm_version_is_reported(monkeypatch, tmp_path, capsys):
     assert "not the tested 0.27" in capsys.readouterr().err
 
 
+@pytest.mark.parametrize("probe_rc,sees", [(0, True), (1, False)])
+def test_vllm_sees_gpu_asks_the_vllm_environments_torch_outside_mps(tmp_path, monkeypatch, probe_rc, sees):
+    from gen_backend import vllm_sees_gpu
+    python = tmp_path / "py"
+    python.write_text('#!/bin/bash\n[ -n "${CUDA_MPS_PIPE_DIRECTORY}" ] && exit 2\n'
+                      f'case "$2" in *cuda.is_available*) exit {probe_rc} ;; esac\nexit 3\n')
+    python.chmod(0o755)
+    monkeypatch.setenv("CUDA_MPS_PIPE_DIRECTORY", "/somewhere/.mps/pipe")
+    assert vllm_sees_gpu(str(python)) is sees
+
+
+def test_a_missing_vllm_interpreter_sees_no_gpu(tmp_path):
+    from gen_backend import vllm_sees_gpu
+    assert vllm_sees_gpu(str(tmp_path / "missing")) is False
+
+
 def test_find_vllm_python_does_not_fall_back_when_vllm_py_is_set(fake_vllm, monkeypatch, tmp_path):
     import gen_backend
     monkeypatch.setattr(gen_backend, "VLLM_CANDIDATES", (fake_vllm.python,))

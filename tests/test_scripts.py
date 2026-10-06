@@ -83,10 +83,12 @@ def test_gpu_defaults_give_the_h200_measurements_only_to_h200_class_cards(mib, e
     assert bash(f"gpu_defaults {mib}").stdout.strip() == expected
 
 
-def vllm_python(tmp_path, version="0.27.1"):
-    """A VLLM_PY that tells gen_backend.find_vllm_python() it holds this vLLM version."""
+def vllm_python(tmp_path, version="0.27.1", gpu=True):
+    """A VLLM_PY that tells gen_backend.find_vllm_python() it holds this vLLM version, and
+    gen_backend.vllm_sees_gpu() whether its torch can use the GPU."""
     python = tmp_path / "vllm_python"
-    python.write_text(f'#!/bin/bash\nif [ "$1" = "-c" ]; then echo "VLLM_VERSION {version}"; exit 0; fi\n')
+    python.write_text(f'#!/bin/bash\ncase "$2" in *cuda.is_available*) exit {0 if gpu else 1} ;; esac\n'
+                      f'if [ "$1" = "-c" ]; then echo "VLLM_VERSION {version}"; exit 0; fi\n')
     python.chmod(0o755)
     return str(python)
 
@@ -95,6 +97,7 @@ def vllm_python(tmp_path, version="0.27.1"):
     ("143771", "", "found", "slots=3 phys=8 mps=1 gpu=39833 lora=18432 gen=vllm cgen=0"),
     ("143771", "", "missing", "slots=3 phys=8 mps=1 gpu=39833 lora=18432 gen=hf cgen=0"),
     ("143771", "", "untested", "slots=3 phys=8 mps=1 gpu=39833 lora=18432 gen=hf cgen=0"),
+    ("143771", "", "no_gpu", "slots=3 phys=8 mps=1 gpu=39833 lora=18432 gen=hf cgen=0"),  # driver too old
     ("46068", "", "found", "slots=1 phys=unset mps=0 gpu=unset lora=unset gen=hf cgen=0"),
     ("143771", "PHYS_BS=16 SLOTS_PER_GPU=2 USE_MPS=0 GEN_BACKEND=hf COMPILE_GEN=1", "found",
      "slots=2 phys=16 mps=0 gpu=39833 lora=18432 gen=hf cgen=1"),
@@ -103,7 +106,7 @@ def test_apply_card_defaults_fills_only_what_the_caller_left_unset(tmp_path, mib
     bin_dir = fake_bin(tmp_path, **{"nvidia-smi": fake_smi(mib)})
     preset = f"export {preset};" if preset else ""          # what the caller's environment already holds
     vllm_py = {"found": lambda: vllm_python(tmp_path), "untested": lambda: vllm_python(tmp_path, "0.30.0"),
-               "missing": lambda: str(tmp_path / "missing")}[vllm]()
+               "no_gpu": lambda: vllm_python(tmp_path, gpu=False), "missing": lambda: str(tmp_path / "missing")}[vllm]()
     out = subprocess.run(["bash", "-c", f'source {os.path.abspath(LIB)}; {preset} apply_card_defaults 0 1; '
                           'echo "slots=$SLOTS_PER_GPU phys=${PHYS_BS:-unset} mps=$USE_MPS '
                           'gpu=${NEED_GPU_MB:-unset} lora=${NEED_LORA_MB:-unset} gen=${GEN_BACKEND:-unset} '

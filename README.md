@@ -204,9 +204,10 @@ Same experiments, same objectives, much less wall-clock. What changed and how to
     checked). A failed vLLM start is retried once without CUDA graphs, and a vLLM that hangs is
     stopped after `VLLM_TIMEOUT_S` (default 1,200 s plus 0.5 s per row).
   - On H200-class cards `GEN_BACKEND` defaults to `vllm` when the tested vLLM 0.27.x is found
-    (`scripts/qwen/lib.sh`), and to `hf` everywhere else. Another vLLM version works only when
-    `GEN_BACKEND=vllm` is set explicitly, with a warning. Measured against Hugging Face on
-    1× H200 NVL, next to running jobs (`tools/gen_parity.py`):
+    and its torch can use the GPU (`scripts/qwen/lib.sh`). vLLM 0.27.1 ships torch for CUDA 13,
+    so with an older driver the default falls back to `hf`. It is `hf` everywhere else. Another
+    vLLM version works only when `GEN_BACKEND=vllm` is set explicitly, with a warning. Measured
+    against Hugging Face on 1× H200 NVL, next to running jobs (`tools/gen_parity.py`):
 
     | check | result |
     |---|---|
@@ -214,8 +215,23 @@ Same experiments, same objectives, much less wall-clock. What changed and how to
     | Distillation path, strict greedy, FewRel task 0 (1,120 rows) | 99.02% identical answers, F1 89.29 → 89.55 |
     | Distillation path, sampled at T=0.5, 3 seeds each | mean F1 89.16 (spread 0.89) → 89.21 (spread 0.49) |
     | Pseudo-labels, ACE task 1, confidence filter on | 99.15% identical rows, the same 17 pseudo-labels |
-    | Answer generation, FewRel task 9 (11,200 rows) | 2,503 s → 572 s |
-    | Answer generation, FewRel task 0 (1,120 rows) | 177-279 s → 113 s |
+    | Speed, trained FewRel model (7 tasks), task 3 test set (4,480 rows), strict greedy | evaluation 318 s → 141 s, of which answer generation about 257 s → 80 s; 99.04% identical answers, F1 59.58 → 59.63 |
+
+    In that speed check vLLM spends 17 s generating. The rest is starting it: 8 s of imports
+    and 50 s of engine start, plus the model export, at every evaluation. The FewRel run's own
+    Hugging Face evaluation, under MPS, takes 170-220 s at this size and 650-1,900 s on the
+    11,200-row test set of task 9. With vLLM each FewRel job should take about 20% less. On small
+    test sets (TACRED, ACE) the start-up makes the two about even.
+
+    An earlier speed row (2,503 s → 572 s on 11,200 rows) is not a guide: it used a task-0 model
+    on rows it was never trained for, and ran under heavier contention.
+
+    Also measured on the same 4,480 prompts (`/venv/main`, outside MPS):
+    - vLLM's Transformers modeling backend (`model_impl="transformers"`): 79 s against 75 s for
+      vLLM's own Qwen3 code, with identical answers.
+    - Transformers 5.15 continuous batching (`generate_batch`) with CUDA graphs: 270 s.
+    - The same with FlashAttention-3 from the kernel hub (`kernels-community/flash-attn3`): 64 s,
+      98.7% identical to vLLM.
 
     End to end, TACRED order 0, all 10 tasks, against the round-1 runs above: RKL final-task
     trigger F1 65.56 → 65.56, IncLoRA 63.06 → 62.98. Peak memory per run, trainer plus its vLLM:

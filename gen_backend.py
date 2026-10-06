@@ -108,10 +108,21 @@ def vllm_supported(version):
     return version.startswith(TESTED_VLLM)
 
 
+def vllm_sees_gpu(python):
+    """Can the vLLM environment's torch use a GPU here, in the environment vLLM runs in? vLLM 0.27.1's
+    torch is built for CUDA 13: with an older driver it sees no GPU and every vLLM start fails."""
+    try:
+        return subprocess.run([python, "-c", "import sys, torch; sys.exit(0 if torch.cuda.is_available() else 1)"],
+                              env=child_env(), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                              timeout=600).returncode == 0
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+
+
 def find_vllm_python():
     """(interpreter, vLLM version) of the vLLM environment: VLLM_PY when it is set (no fallback),
     else the first of VLLM_CANDIDATES that imports vllm. An untested version is reported on stderr;
-    the H200 default (scripts/qwen/lib.sh) only picks vLLM when vllm_supported() holds."""
+    the H200 default (scripts/qwen/lib.sh) only picks vLLM when vllm_supported() and vllm_sees_gpu() hold."""
     candidates = [os.environ["VLLM_PY"]] if os.environ.get("VLLM_PY") else list(VLLM_CANDIDATES)
     for python in candidates:
         if not os.path.exists(python):
