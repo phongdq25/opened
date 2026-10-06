@@ -270,7 +270,8 @@ Same experiments, same objectives, much less wall-clock. What changed and how to
     `OURS_PHYS_BS=32 OURS_GRAD_CKPT=1` gives Ours and its ablations these settings while the
     baselines of the same launch keep `PHYS_BS` and `GRAD_CKPT`.
   - `bash tools/bench_ours.sh <tag>` on a free card compares packings for Ours runs: 3 runs at
-    PHYS_BS 16 and 3 at 32 with checkpointing, then one run per card at 16 without and at 32 with.
+    PHYS_BS 16 and 3 at 32 with checkpointing, and one run per card at 32 without (104.1 GiB in
+    the table below).
 
 Measured on 1× H200 NVL (`bash tools/bench_gpu.sh h200`):
 

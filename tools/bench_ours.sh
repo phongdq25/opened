@@ -6,8 +6,8 @@
 #
 # tools/bench_gpu.sh's Ours workload (ACE task 1: sfkl + span + PL + boost x5 + SD, 320 rows, 1 epoch,
 # loss groups of 2) with COMPILE_GEN=1 (Ours' setting) and CUDA MPS, the runs of a row at the same time:
-#   3 x PHYS_BS 16 and 3 x PHYS_BS 32 with GRAD_CKPT=1 (3 runs per card), then one run per card:
-#   PHYS_BS 16 without checkpointing (67.5 GiB) and PHYS_BS 32 with it (32 without needs ~130 GB).
+#   3 x PHYS_BS 16 and 3 x PHYS_BS 32 with GRAD_CKPT=1 (3 runs per card), and one run per card at
+#   PHYS_BS 32 without checkpointing, the fastest single run (104.1 GiB in the README's table).
 # s_per_update is the steady state: the mean "step time" after the first two log lines, which hold the
 # compile warm-up. steady_updates_per_h = runs x 3600 / s_per_update, the card's training rate;
 # updates_per_h = finished runs x updates per run x 3600 / wall seconds, with PL, eval and start-up in.
@@ -60,7 +60,7 @@ OURS=(--mode ce_kd --kd-type sfkl --w-span 2.0 --kd-ratio 0.9 --skew 0.1 --span-
 export CUDA_MPS_PIPE_DIRECTORY=${PWD}/.mps/pipe CUDA_MPS_LOG_DIRECTORY=${PWD}/.mps/log
 mkdir -p "${CUDA_MPS_PIPE_DIRECTORY}" "${CUDA_MPS_LOG_DIRECTORY}"
 nvidia-cuda-mps-control -d || { echo "no usable CUDA MPS in this container"; exit 1; }
-for row in "3 16 1" "3 32 1" "1 16 0" "1 32 1"; do
+for row in "3 16 1" "3 32 1" "1 32 0"; do
     read -r N P C <<< "${row}"
     t=$(date +%s); sampler_start "${OUT}/pack_${N}x${P}_ckpt${C}.csv"
     pids=()
