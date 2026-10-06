@@ -37,6 +37,10 @@
 #   GEN_BACKEND   hf | vllm: where evaluation answers and pseudo-labels come from (default: by card size)
 #   COMPILE_GEN   1 = compiled sampling inside training steps (default: by card size)
 #   GRAD_CKPT     1 = gradient checkpointing in the CED runners: less memory, same loss (default 0)
+#   OURS_PHYS_BS / OURS_GRAD_CKPT
+#                 PHYS_BS / GRAD_CKPT for Ours and its ablations only, so the baselines of the same
+#                 launch keep theirs; on H200 OURS_PHYS_BS=32 OURS_GRAD_CKPT=1 (README). Default: the
+#                 launch's PHYS_BS / GRAD_CKPT
 #   PERMS         default "0 1 2 3 4"
 #   DS            dataset, default fewrel: ace maven rams geneva (CED), tacred fewrel (CRE)
 #   DATA_PREFIX   default <ds>_b10_perm (CED) or <ds>_perm (CRE), the names under data/
@@ -330,6 +334,16 @@ run_dir () {  # $1=config name  $2=sd  $3=perm
     echo "${R}/ours_${VARIANT}${tag}_$1_perm$3_${PROTOCOL}_s${SEED}"
 }
 
+job_settings () {  # $1=config name  $2=sd -> the PHYS_BS / GRAD_CKPT the job runs with
+    # Ours and its ablations (sd 0/1, run by ours_queue.sh) take OURS_PHYS_BS / OURS_GRAD_CKPT when
+    # set; everything else, Ours' plain-SFT task0 included, the launch's own
+    case $2 in
+        0|1) [ "$1" = "task0" ] || {
+                 echo "PHYS_BS=${OURS_PHYS_BS:-${PHYS_BS:-}} GRAD_CKPT=${OURS_GRAD_CKPT:-${GRAD_CKPT:-0}}"; return; } ;;
+    esac
+    echo "PHYS_BS=${PHYS_BS:-} GRAD_CKPT=${GRAD_CKPT:-0}"
+}
+
 # Finished? One run dir with a .complete marker. CRE baselines are one job per method. The
 # shared CE task0 of an order counts as done while its merged model exists, or once every
 # distillation method of that order has finished (then nothing needs it any more).
@@ -391,7 +405,9 @@ GPUS=()
 for _ in $(seq 1 "${SLOTS_PER_GPU}"); do
     for g in ${POOL_GPUS:-0}; do GPUS+=("${g}"); done   # round-robin: the first jobs spread over the cards
 done
-step "3. train ${#JOBS[@]} jobs on gpus ${GPUS[*]} (PHYS_BS=${PHYS_BS:-runner default} USE_MPS=${USE_MPS} GEN_BACKEND=${GEN_BACKEND} COMPILE_GEN=${COMPILE_GEN} GRAD_CKPT=${GRAD_CKPT:-0})"
+OURS_SETTINGS=""
+[ -n "${OURS_PHYS_BS:-}${OURS_GRAD_CKPT:-}" ] && OURS_SETTINGS="; Ours $(job_settings g1_full 1)"
+step "3. train ${#JOBS[@]} jobs on gpus ${GPUS[*]} (PHYS_BS=${PHYS_BS:-runner default} USE_MPS=${USE_MPS} GEN_BACKEND=${GEN_BACKEND} COMPILE_GEN=${COMPILE_GEN} GRAD_CKPT=${GRAD_CKPT:-0}${OURS_SETTINGS})"
 mkdir -p logs
 POOL_LOG=logs/${DS}_matrix_pool.log
 echo "progress: ${POOL_LOG}   per-run logs: logs_ours_*.log and ${R}/<run>/task*/train.log"
@@ -425,7 +441,7 @@ launch () {  # $1=job $2=gpu $3=slot -> starts it in the background; torchrun po
         PERM="${perm}" GPU="$2" DATA_PREFIX="${DATA_PREFIX}" SEED="${SEED}" PROTOCOL="${PROTOCOL}" \
         OURS_VARIANT="${VARIANT}" OURS_SD="${sd}" SD_ARGS="${sd_args}" RUN_SUFFIX="_${name}" \
         RESUME=0 MASTER_PORT=${port} \
-            bash scripts/qwen/ced/ours_queue.sh ${flags}
+            env $(job_settings "${name}" "${sd}") bash scripts/qwen/ced/ours_queue.sh ${flags}
     fi >> "${POOL_LOG}" 2>&1 &
 }
 
@@ -476,7 +492,8 @@ pick () {  # sets JOB to the first startable job and drops it from PENDING; 1 if
 if [ "${DRY}" = "1" ]; then
     for job in "${JOBS[@]}"; do
         IFS='|' read -r name sd flags sd_args perm <<< "${job}"
-        printf '  %-14s perm%s  sd=%s  %s %s\n' "${name}" "${perm}" "${sd}" "${flags}" "${sd_args}"
+        printf '  %-14s perm%s  sd=%s  %s %s  [%s]\n' "${name}" "${perm}" "${sd}" "${flags}" "${sd_args}" \
+            "$(job_settings "${name}" "${sd}")"
     done
     echo "DRY=1: no training, but the scheduler below still runs against stub jobs."
 fi

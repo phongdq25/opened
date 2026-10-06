@@ -257,9 +257,20 @@ Same experiments, same objectives, much less wall-clock. What changed and how to
     `COMPILE_GEN=1`, the trainer peaked at 20.8 GB (67.5 GiB at 16 without checkpointing, in the
     table below). It took 7.6-7.8 s per update after warm-up, against 21.7-23.2 s at PHYS_BS 8
     eager.
+  - PHYS_BS 32, one physical batch per update of `--bs 2 --acc 16`, is faster still. Run back to
+    back with PHYS_BS 16 next to the same three FewRel jobs, both with checkpointing and
+    `COMPILE_GEN=1`: 6.3 s against 7.9 s per update over the last two log windows, with peaks of
+    27.2 GB and 21.5 GB.
+  - The trainers count steps from 1, so they never apply a run's last update (the original code
+    included), and a run with several micro-steps per update logs half its first loss. A physical
+    batch that holds a whole update would apply that update; `ced_step.first_global_step` makes it
+    count like the run it splits, so PHYS_BS 32 trains, logs, saves and evaluates exactly as 8 and
+    16 do (`tests/test_ced_step.py`).
   - Baselines already fit at PHYS_BS 16 and only pay the recomputation, so leave it off for them.
+    `OURS_PHYS_BS=32 OURS_GRAD_CKPT=1` gives Ours and its ablations these settings while the
+    baselines of the same launch keep `PHYS_BS` and `GRAD_CKPT`.
   - `bash tools/bench_ours.sh <tag>` on a free card compares packings for Ours runs: 3 runs at
-    PHYS_BS 8, 3 at 16 and 3 at 32 with checkpointing, and 1 at 32 without.
+    PHYS_BS 16 and 3 at 32 with checkpointing, then one run per card at 16 without and at 32 with.
 
 Measured on 1× H200 NVL (`bash tools/bench_gpu.sh h200`):
 

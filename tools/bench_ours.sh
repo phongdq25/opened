@@ -6,9 +6,13 @@
 #
 # tools/bench_gpu.sh's Ours workload (ACE task 1: sfkl + span + PL + boost x5 + SD, 320 rows, 1 epoch,
 # loss groups of 2) with COMPILE_GEN=1 (Ours' setting) and CUDA MPS, the runs of a row at the same time:
-#   3 x PHYS_BS 8 (the H200 default), 3 x PHYS_BS 16 and 3 x PHYS_BS 32 with GRAD_CKPT=1,
-#   1 x PHYS_BS 32 without (one run per card).
-# updates_per_h = finished runs x updates per run x 3600 / wall seconds.
+#   3 x PHYS_BS 16 and 3 x PHYS_BS 32 with GRAD_CKPT=1 (3 runs per card), then one run per card:
+#   PHYS_BS 16 without checkpointing (67.5 GiB) and PHYS_BS 32 with it (32 without needs ~130 GB).
+# s_per_update is the steady state: the mean "step time" after the first two log lines, which hold the
+# compile warm-up. steady_updates_per_h = runs x 3600 / s_per_update, the card's training rate;
+# updates_per_h = finished runs x updates per run x 3600 / wall seconds, with PL, eval and start-up in.
+# Measured on the shared card next to three FewRel jobs (2026-10-06), one run each: PHYS_BS 16 7.9 s
+# and 21.5 GB, PHYS_BS 32 6.3 s and 27.2 GB, both with GRAD_CKPT=1; PHYS_BS 8 without: about 22 s.
 #
 # Gradient checkpointing leaves Ours' loss and gradients unchanged (tests/test_ced_step.py). Ours
 # runs do not repeat exactly on the GPU, with or without it, so this does not compare losses.
@@ -23,7 +27,7 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 [ -d /usr/local/cuda ] && export CUDA_HOME=/usr/local/cuda
 R=results/qwen3/ced
 SUMMARY=${OUT}/ours.tsv
-printf "phase\tphys\truns\tckpt\twall_s\ts_per_update\tpeak_gib\tupdates_per_h\n" > "${SUMMARY}"
+printf "phase\tphys\truns\tckpt\twall_s\ts_per_update\tsteady_updates_per_h\tpeak_gib\tupdates_per_h\n" > "${SUMMARY}"
 
 sampler_start () {
     nvidia-smi --query-gpu=memory.used,utilization.gpu --format=csv,noheader,nounits -i 0 -lms 500 > "$1" &
@@ -31,8 +35,9 @@ sampler_start () {
 }
 peak_gib () { awk -F', *' '{ if ($1 > m) m = $1 } END { printf "%.1f", m / 1024 }' "$1"; }
 train_lines () { grep -h "^train | epoch" "${R}/$1/task1/log.txt" 2>/dev/null; }
-step_time () {  # $1=run name -> mean "step time" of its train lines (s per update)
-    train_lines "$1" | grep -oE "step time: [0-9.]+" | awk '{ s += $3; n++ } END { printf "%.2f", (n ? s / n : 0) }'
+step_time () {  # $1=run name -> mean "step time" of its train lines after the first two (s per update)
+    train_lines "$1" | tail -n +3 | grep -oE "step time: [0-9.]+" \
+        | awk '{ s += $3; n++ } END { printf "%.2f", (n ? s / n : 0) }'
 }
 updates () {  # $1=run name -> updates in its epoch, from the last "global iter: x/<updates>"
     train_lines "$1" | tail -1 | grep -oE "global iter: +[0-9]+/ *[0-9]+" | awk -F/ '{ print $2 + 0 }'
@@ -55,7 +60,7 @@ OURS=(--mode ce_kd --kd-type sfkl --w-span 2.0 --kd-ratio 0.9 --skew 0.1 --span-
 export CUDA_MPS_PIPE_DIRECTORY=${PWD}/.mps/pipe CUDA_MPS_LOG_DIRECTORY=${PWD}/.mps/log
 mkdir -p "${CUDA_MPS_PIPE_DIRECTORY}" "${CUDA_MPS_LOG_DIRECTORY}"
 nvidia-cuda-mps-control -d || { echo "no usable CUDA MPS in this container"; exit 1; }
-for row in "3 8 0" "3 16 1" "3 32 1" "1 32 0"; do
+for row in "3 16 1" "3 32 1" "1 16 0" "1 32 1"; do
     read -r N P C <<< "${row}"
     t=$(date +%s); sampler_start "${OUT}/pack_${N}x${P}_ckpt${C}.csv"
     pids=()
@@ -70,8 +75,10 @@ for row in "3 8 0" "3 16 1" "3 32 1" "1 32 0"; do
     done_runs=$(compgen -G "${R}/bench_pack_${N}x${P}_*/.complete" | wc -l)
     phase=pack
     [ "${done_runs}" = "${N}" ] || phase=pack_failed
-    printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n" "${phase}" "${P}" "${N}" "${C}" "${wall}" \
-        "$(step_time "bench_pack_${N}x${P}_1")" "$(peak_gib "${OUT}/pack_${N}x${P}_ckpt${C}.csv")" \
+    s=$(step_time "bench_pack_${N}x${P}_1")
+    printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n" "${phase}" "${P}" "${N}" "${C}" "${wall}" "${s}" \
+        "$(awk -v n="${N}" -v s="${s}" 'BEGIN { printf "%.0f", (s > 0 ? n * 3600 / s : 0) }')" \
+        "$(peak_gib "${OUT}/pack_${N}x${P}_ckpt${C}.csv")" \
         "$(awk -v n="${done_runs}" -v u="$(updates "bench_pack_${N}x${P}_1")" -v w="${wall}" \
            'BEGIN { printf "%.0f", n * u * 3600 / w }')" >> "${SUMMARY}"
 done
