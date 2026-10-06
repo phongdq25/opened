@@ -161,6 +161,51 @@ def test_both_trainers_count_updates_through_the_guard():
         assert "updates_per_epoch(" in inspect.getsource(trainer.main)
 
 
+def trainer_counts(physical_accumulation, logical_accumulation, total_iters):
+    """The trainers' step bookkeeping (test_both_trainers_count_steps_this_way pins it to their
+    source): the updates they apply, and the global_step their log/save/eval checks see after each."""
+    from ced_step import first_global_step
+    step, global_step = 1, first_global_step(physical_accumulation, logical_accumulation)
+    micro_steps, seen = 0, []
+    while True:
+        micro_steps += 1                       # DeepSpeed applies an update every accumulation micro-steps
+        if step % physical_accumulation == 0:
+            seen.append(global_step)
+        step += 1
+        if step % physical_accumulation == 0:
+            global_step += 1
+        if global_step > total_iters:
+            break
+    return micro_steps // physical_accumulation, seen
+
+
+@pytest.mark.parametrize("total_iters", [3, 10])
+def test_every_physical_batch_trains_logs_and_stops_like_the_run_it_splits(total_iters):
+    # --bs 2 --acc 16 had 16 micro-steps per update; physical batches of 8, 16 and 32 rows have
+    # 4, 2 and 1. The trainers never apply a run's last update, and neither may 32 rows, or Ours
+    # at PHYS_BS=32 would train one update more than the same run at any other batch
+    original = trainer_counts(16, 16, total_iters)
+    assert original == (total_iters - 1, list(range(2, total_iters + 1)))
+    for physical in (4, 2, 1):
+        assert trainer_counts(physical, 16, total_iters) == original
+
+
+def test_a_run_with_one_micro_step_per_update_still_applies_every_update():
+    assert trainer_counts(1, 1, 10) == (10, list(range(1, 11)))       # --acc 1, as it always was
+
+
+def test_both_trainers_count_steps_this_way():
+    import inspect
+
+    import ced_finetune
+    import finetune
+    for trainer in (ced_finetune, finetune):
+        source = " ".join(inspect.getsource(trainer.finetune).split())
+        assert "step, global_step = 1, first_global_step(args.gradient_accumulation_steps," in source
+        assert ("step += 1 if step % args.gradient_accumulation_steps == 0: global_step += 1 "
+                "if global_step > args.total_iters: break") in source
+
+
 @pytest.mark.parametrize("kd_type", KD_TYPES)
 def test_token_kd_matches_the_reference(kd_type, fewrel, student, teacher, tokenizer):
     args, ds = fewrel

@@ -47,7 +47,7 @@ from peft import PeftModel
 from ed_eval import ed_evaluate
 from gen_config import generation_kwargs
 from ced_eval import check_gen_backend, evaluate, eval_plan, final_test_missing
-from ced_step import grouped_ce_loss, updates_per_epoch
+from ced_step import first_global_step, grouped_ce_loss, updates_per_epoch
 
 torch.set_num_threads(4)
 
@@ -269,7 +269,9 @@ def finetune(args, tokenizer: AutoTokenizer, model: deepspeed.DeepSpeedEngine, o
         
     student_generator = SampleGenerator(args, tokenizer)
 
-    step, global_step = 1, 1
+    # one physical batch per update counts as the --bs/--acc run it splits (ced_step.first_global_step)
+    step, global_step = 1, first_global_step(args.gradient_accumulation_steps,
+                                             args.batch_size * args.gradient_accumulation_steps // args.loss_group_size)
     total_loss, total_distil_loss, total_time = 0.0, 0.0, 0.0
     
     adaptive_threshold = args.init_threshold if "adaptive" in args.type else -1.0

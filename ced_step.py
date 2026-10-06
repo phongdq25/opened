@@ -49,6 +49,17 @@ def updates_per_epoch(n_rows, batch_size, world_size, accumulation):
     return updates
 
 
+def first_global_step(physical_accumulation, logical_accumulation):
+    """The global_step a trainer's loop starts at. The trainers start step and global_step at 1
+    and advance global_step after micro-step accumulation - 1 of each update. With several
+    micro-steps per update, that puts the log, save and eval checks after update m at m + 1, and
+    ends the loop one micro-step short of the last update, which is never applied. A physical
+    batch holding a whole update (PHYS_BS >= --bs x --acc) has no micro-step before the update
+    ends, so it starts one ahead: it then logs, saves, evaluates and stops as the run it splits.
+    A run with one micro-step per update to begin with (--acc 1) keeps 1 and every update."""
+    return 2 if physical_accumulation == 1 and logical_accumulation > 1 else 1
+
+
 @dataclass
 class StepLoss:
     loss: torch.Tensor          # sum over groups / groups per full batch: what the engine backpropagates

@@ -48,7 +48,7 @@ from rouge_metric import compute_metrics
 from peft import PeftModel
 from ed_eval import ed_evaluate
 import ced_omask
-from ced_step import ced_step_loss, distillm_replace_groups, group_slices, updates_per_epoch
+from ced_step import ced_step_loss, distillm_replace_groups, first_global_step, group_slices, updates_per_epoch
 from ced_losses import (
     get_distil_loss, select_batch_rows, replace_batch_rows, generate_replay_rows,
     SD_EOS_IDS, sd_lora_params, sd_ema_init, sd_ema_update, sd_ema_weights, sd_left_pad,
@@ -349,9 +349,11 @@ def finetune(args, tokenizer: AutoTokenizer, model: deepspeed.DeepSpeedEngine, o
         
     student_generator = SampleGenerator(args, tokenizer)
 
-    step, global_step = 1, 1
+    # one physical batch per update counts as the --bs/--acc run it splits (ced_step.first_global_step)
+    step, global_step = 1, first_global_step(args.gradient_accumulation_steps,
+                                             args.batch_size * args.gradient_accumulation_steps // args.loss_group_size)
     total_loss, total_distil_loss, total_time = 0.0, 0.0, 0.0
-    
+
     adaptive_threshold = args.init_threshold if "adaptive" in args.type else -1.0
     prev_avg_loss = (
         evaluate_loss(args, model, dataset["dev"], device)
