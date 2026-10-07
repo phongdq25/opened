@@ -8,3 +8,4 @@
 --url https://huggingface.co/datasets/datht/processed-cl-fewrel/resolve/main/fewrel_all.tar.gz /mnt/local/@PROJECT@/OpenED
 #models
 --hf Qwen/Qwen3-0.6B /mnt/local/@PROJECT@/OpenED/models/Qwen3-0.6B
+
