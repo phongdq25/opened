@@ -4,7 +4,8 @@ micro-batch.
 ced_finetune.py defines its objective per micro-batch:
   - CE and KD are token means over the micro-batch;
   - the (1 - kd_ratio) * CE + kd_ratio * KD mix applies only to micro-batches that hold a
-    memory (or pseudo-labelled) row;
+    memory (or pseudo-labelled) row; --ced-ce-mix rows narrows the (1 - kd_ratio) on CE to the
+    memory rows' tokens of such a micro-batch (default batch: every row's, as above);
   - the span loss normalizes over the micro-batch's span pairs.
 
 --loss-group-size keeps that definition while one forward covers --batch-size rows. Rows
@@ -175,7 +176,14 @@ def ced_step_loss(args, model, teacher_model, model_batch, no_model_batch, captu
             ce_label = lab_g.clone()
             ce_label[rep_g] = IGNORE
         ce_pos = ce_label != IGNORE
-        if ce_pos.any():
+        ce_rows = getattr(args, "ced_ce_mix", "batch") == "rows" and has_kd[j]
+        if ce_pos.any() and ce_rows:
+            # --ced-ce-mix rows: the same token mean over the micro-batch, but (1 - kd_ratio) only
+            # on the memory rows' tokens; the mix below then leaves CE unscaled
+            tok = F.cross_entropy(logits[gs][ce_pos].float(), ce_label[ce_pos], reduction="none")
+            w = torch.where(rep_g.unsqueeze(1).expand_as(ce_pos)[ce_pos], 1 - args.kd_ratio, 1.0)
+            lm = (w * tok).mean()
+        elif ce_pos.any():
             lm = F.cross_entropy(logits[gs][ce_pos].float(), ce_label[ce_pos])
         else:
             lm = torch.tensor(0.0, device=device)
@@ -202,7 +210,10 @@ def ced_step_loss(args, model, teacher_model, model_batch, no_model_batch, captu
                     s_n, t_n = _gather(logits, t_logits, t_index, gs.start, keep_new)
                     distil_new = get_distil_loss(args, t_n, _all_valid(keep_new), s_n)
 
-        loss = (1 - args.kd_ratio) * lm + args.kd_ratio * distil if has_kd[j] else lm
+        if has_kd[j]:
+            loss = (lm if ce_rows else (1 - args.kd_ratio) * lm) + args.kd_ratio * distil
+        else:
+            loss = lm
         if lwf[j]:
             loss = loss + min(kd_ratio_new, getattr(args, "ced_kd_new_cap", 0.3)) * distil_new
         if sd_logits is not None:

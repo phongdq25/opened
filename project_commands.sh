@@ -171,6 +171,31 @@ CONFIGS_ALL=(
   "b_dist|credist||"
   "b_cllora|crecl||"
 
+  # ---- tuning (09/10), CRE: what makes Ours trail RKL on TACRED.
+  #   DS=tacred ONLY=t PERMS="0 1 2" bash project_commands.sh
+  # Base is f12_pl (variant h2: PL with dedup + lexicon, no confidence filter, replay x5, SFKL + span
+  # KD, no SD), the Ours row of the CEE tables. Every t_ run starts from the same shared task0 of its
+  # order and samples eagerly (COMPILE_GEN=0, launch below). One change per run:
+  #   t_f12           the reference, f12_pl as is
+  #   t_ce            new-task rows keep CE x1 next to memory rows (--ced-ce-mix rows, ced_step.py);
+  #                   by default a micro-batch holding one memory row scales every row's CE by 0.1
+  #   t_rkl           KD divergence RKL instead of SFKL (the best TACRED baseline is RKL)
+  #   t_rkl_ce        t_rkl + t_ce
+  #   t_rkl_b3/b10    t_rkl with the memory rows repeated 3 / 10 times per epoch instead of 5
+  #   t_rkl_sd        t_rkl + SD as in the paper (forward KL, EMA 0.99, weight 1)
+  #   t_rkl_sdp       t_rkl_sd, but rollouts that are not valid JSON are left out of the SD loss
+  #   t_rkl_sdp_w03   t_rkl_sdp with SD weight 0.3
+  # No "without PL" arm: on these pair-level splits PL adds no pseudo-label (pl_task*.log: aug_rows 0).
+  "t_f12|0||"
+  "t_ce|0|--extra --ced-ce-mix=rows|"
+  "t_rkl|0|--kd-type rkl|"
+  "t_rkl_ce|0|--kd-type rkl --extra --ced-ce-mix=rows|"
+  "t_rkl_b3|0|--kd-type rkl --replay-boost 3|"
+  "t_rkl_b10|0|--kd-type rkl --replay-boost 10|"
+  "t_rkl_sd|1|--kd-type rkl|"
+  "t_rkl_sdp|1|--kd-type rkl|--sd-skip-unparsed 1"
+  "t_rkl_sdp_w03|1|--kd-type rkl|--sd-skip-unparsed 1 --w-sd 0.3"
+
   # ---- round 2 (01/10). Not used by any paper table any more; kept so it can be re-run.
   #   a_rand  KD/SD drawn at random per update (professor note 7b; --ced-sd-mix)
   #   d_ce    CE with memory 0 (the rehearsal table now compares with CL-LoRA instead)
@@ -335,6 +360,10 @@ PROTOCOL=${PROTOCOL:-${DS}_v2}
 VARIANT=${VARIANT:-h12}          # PL with dedup + lexicon + confidence, no H3 calibration epoch
 R=results/qwen3/ced
 
+variant_of () {  # $1=config name -> ours_queue.sh's OURS_VARIANT: the tuning runs start from f12_pl (h2)
+    case $1 in t_*) echo h2 ;; *) echo "${VARIANT}" ;; esac
+}
+
 run_dir () {  # $1=config name  $2=sd  $3=perm
     if [ "$1" = "task0" ]; then echo "${R}/dist_shared_task0_perm$3_${PROTOCOL}_s${SEED}"; return; fi
     # memory-0 CL-LoRA: its own protocol tag, so it never collides with the buffer-10 runs
@@ -342,7 +371,7 @@ run_dir () {  # $1=config name  $2=sd  $3=perm
     # CRE baselines: the runner names their run dirs; this is only a label for the pool log
     case $2 in credist*|crecl*) echo "${R}/<$1 ${DS} perm$3>"; return ;; esac
     local tag=""; [ "$2" = "1" ] && tag="_sd"
-    echo "${R}/ours_${VARIANT}${tag}_$1_perm$3_${PROTOCOL}_s${SEED}"
+    echo "${R}/ours_$(variant_of "$1")${tag}_$1_perm$3_${PROTOCOL}_s${SEED}"
 }
 
 job_settings () {  # $1=config name  $2=sd -> the PHYS_BS / GRAD_CKPT the job runs with
@@ -373,7 +402,9 @@ job_done () {  # $1=config name  $2=sd  $3=perm
             for m in ${CRE_DIST_METHODS}; do cre_dist_done "${m}" "$3" || return 1; done ;;
         credist:*) cre_dist_done "${2#credist:}" "$3" ;;
         crecl:*)   [ -f "${R}/cllora_${2#crecl:}_perm$3_${DS}_cre_s${SEED}/.complete" ] ;;
-        *) [ -f "$(run_dir "$1" "$2" "$3")/.complete" ] ;;
+        *) [ -f "$(run_dir "$1" "$2" "$3")/.complete" ] || return 1
+           # Ours' task0 also needs its merged model, which the runs start from
+           [ "$1" != "task0" ] || [ -d "$(run_dir task0 0 "$3")/task0/merged" ] ;;
     esac
 }
 
@@ -442,8 +473,13 @@ launch () {  # $1=job $2=gpu $3=torchrun port -> starts it in the background
         return
     fi
     if [ "${name}" = "task0" ]; then
-        # one task only, so a half-trained one is restarted rather than resumed
-        rm -rf "$(run_dir task0 0 "${perm}")"
+        # one task only, so a half-trained one is restarted rather than resumed. A finished one that
+        # lost its merged model (see the T0 states below) is moved aside, not deleted.
+        local t0dir; t0dir=$(run_dir task0 0 "${perm}")
+        if [ -f "${t0dir}/.complete" ]; then
+            mkdir -p "${R}/_failed"; mv "${t0dir}" "${R}/_failed/$(basename "${t0dir}")_nomerged_$(date +%Y%m%d_%H%M)"
+        fi
+        rm -rf "${t0dir}"
         MASTER_PORT=${port} bash scripts/qwen/ced/run_ced_v2.sh \
             --run-name "$(basename "$(run_dir task0 0 "${perm}")")" --mode sft \
             --data-prefix "${DATA_PREFIX}" --perm "${perm}" \
@@ -460,9 +496,11 @@ launch () {  # $1=job $2=gpu $3=torchrun port -> starts it in the background
         bash scripts/qwen/ced/run_cllora.sh --method "${name#l_}" --data-root "data/${DS}_b0_perm${perm}" \
             --protocol "${DS}_b0_v2" --seed "${SEED}" --gpu "$2" --py "${PY}"
     else
+        # tuning runs sample eagerly whatever the launch sets: compiled sampling broke Ours (NOTES.md)
+        local cgen=${COMPILE_GEN:-0}; [[ "${name}" == t_* ]] && cgen=0
         PERM="${perm}" GPU="$2" DATA_PREFIX="${DATA_PREFIX}" SEED="${SEED}" PROTOCOL="${PROTOCOL}" \
-        OURS_VARIANT="${VARIANT}" OURS_SD="${sd}" SD_ARGS="${sd_args}" RUN_SUFFIX="_${name}" \
-        RESUME=0 MASTER_PORT=${port} \
+        OURS_VARIANT="$(variant_of "${name}")" OURS_SD="${sd}" SD_ARGS="${sd_args}" RUN_SUFFIX="_${name}" \
+        RESUME=0 MASTER_PORT=${port} COMPILE_GEN=${cgen} \
             env $(job_settings "${name}" "${sd}") bash scripts/qwen/ced/ours_queue.sh ${flags}
     fi >> "${POOL_LOG}" 2>&1 &
 }
@@ -470,7 +508,10 @@ launch () {  # $1=job $2=gpu $3=torchrun port -> starts it in the background
 # task0 state per perm: done | pending | running | failed
 declare -A T0
 for p in ${PERMS}; do
-    [ -f "$(run_dir task0 0 "${p}")/.complete" ] && T0[${p}]=done || T0[${p}]=pending
+    # done only with its merged model on disk: the runs start from task0/merged, and run_ced_v2.sh
+    # stops with "missing shared task0 model" when only the logs are left
+    t0dir=$(run_dir task0 0 "${p}")
+    if [ -f "${t0dir}/.complete" ] && [ -d "${t0dir}/task0/merged" ]; then T0[${p}]=done; else T0[${p}]=pending; fi
 done
 # the CRE distillation jobs' shared CE task0, same states
 declare -A T0CRE

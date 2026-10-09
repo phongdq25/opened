@@ -285,6 +285,9 @@ def add_ced_args(parser: argparse.ArgumentParser):
                        help="replay batches: CE + KD, or KD only")
     group.add_argument("--ced-kd-scope", type=str, default="replay", choices=["replay", "pl"],
                        help="KD coverage: replay rows only, or also old-event tokens of pseudo-labeled rows")
+    group.add_argument("--ced-ce-mix", type=str, default="batch", choices=["batch", "rows"],
+                       help="where (1 - kd_ratio) scales CE in a micro-batch that distills: batch = every "
+                            "row's tokens (4257d86); rows = only the memory rows' tokens, new-task rows keep CE x1")
     group.add_argument("--ced-kd-ratio-new", type=float, default=0.0,
                        help="LwF: KD weight on the old teacher's logits over NEW-task rows' non-new-type "
                             "tokens (0 = off). Added on top of the replay KD, not stealing from CE.")
